@@ -1,0 +1,18 @@
+{
+  "name": "My project",
+  "root": "../my-project",
+  "port": 7878,
+  "apps": [
+    {
+      "id": "web", "name": "Web app", "lang": "ts",
+      "root": "frontend", "include": ["src"],
+      "httpClients": ["api"], "backend": "api", "pathPrefix": "",
+      "alias": {"@/": "src/"}
+    },
+    {
+      "id": "api", "name": "Backend", "lang": "py",
+      "root": "backend", "include": ["app"],
+      "db": {"id": "pg", "name": "Postgres", "client": "Database client (shared)"}
+    }
+  ]
+}

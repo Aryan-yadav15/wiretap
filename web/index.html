@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Wiretap</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Schibsted+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap">
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<div class="wrap">
+  <div class="top">
+    <div class="brand"><h1>Wiretap</h1><span class="proj" id="proj"></span></div>
+    <div class="seg" role="group" aria-label="View" id="views">
+      <button data-v="system">System</button>
+      <button data-v="map">Map</button>
+      <button data-v="live" id="live-tab">Live</button>
+      <button data-v="trace">Trace</button>
+      <button data-v="resources">Resources</button>
+    </div>
+    <div class="search">
+      <input id="q" type="search" placeholder="Find a file, function, route or table  ( / )" autocomplete="off" aria-label="Search">
+      <div class="results" id="results" hidden></div>
+    </div>
+    <span class="status" id="status"><i></i><span>connecting</span></span>
+  </div>
+  <div class="main">
+    <div class="card">
+      <nav class="crumbs" id="crumbs" aria-label="Path"></nav>
+      <div class="readout" id="readout" aria-live="polite"></div>
+      <div class="tools" id="tools" hidden></div>
+      <div class="scroll" id="scroll"><svg id="svg" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Map"></svg><div id="empty"></div></div>
+      <div class="legend" id="legend"></div>
+    </div>
+    <aside class="card panel" id="panel"></aside>
+  </div>
+</div>
+<script src="/app.js"></script>
+</body>
+</html>

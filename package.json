@@ -1,0 +1,8 @@
+{
+  "name": "wiretap",
+  "private": true,
+  "description": "Parses TypeScript for Wiretap. Run npm install once; nothing else uses Node packages.",
+  "devDependencies": {
+    "typescript": "5.9.3"
+  }
+}

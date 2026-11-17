@@ -1,0 +1,8 @@
+.wiretap-cache/
+__pycache__/
+*.pyc
+# your project's config stays local; start from wiretap.config.example.json
+/wiretap.config.json
+# written by Claude Code when it loads the mod
+claude-mod/*/.claude-plugin/types/
+node_modules/

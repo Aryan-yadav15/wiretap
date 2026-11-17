@@ -1,0 +1,10 @@
+{
+  "name": "Fixture",
+  "root": ".",
+  "port": 7899,
+  "apps": [
+    {"id": "web", "name": "Web", "lang": "ts", "root": "web", "include": ["src"], "httpClients": ["api"], "backend": "api"},
+    {"id": "api", "name": "API", "lang": "py", "root": "backend", "include": ["app"],
+     "db": {"id": "pg", "name": "Postgres", "client": "Supabase client (shared)"}}
+  ]
+}

@@ -1,0 +1,1 @@
+{ "name": "wiretap-live", "version": "0.1.0", "description": "A button above the prompt (and /wiretap) that opens this session's Wiretap Live view in the browser" }
