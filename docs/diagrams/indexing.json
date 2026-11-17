@@ -1,0 +1,272 @@
+{
+  "schema_version": 1,
+  "diagram_type": "dataflow",
+  "meta": {
+    "title": "How a codebase becomes the map",
+    "output": "indexing.html",
+    "viewBox": [
+      1080,
+      560
+    ],
+    "quality_profile": "showcase",
+    "repository": {
+      "url": "https://github.com/Aryan-yadav15/wiretap.git",
+      "provider": "github",
+      "link_mode": "web",
+      "revision": "b36a7bdb5d417f1c43b8f01eb540c26611d63281"
+    }
+  },
+  "stages": [
+    {
+      "label": "Source"
+    },
+    {
+      "label": "Parse"
+    },
+    {
+      "label": "Cache"
+    },
+    {
+      "label": "Link"
+    },
+    {
+      "label": "Serve"
+    }
+  ],
+  "nodes": [
+    {
+      "id": "pyfiles",
+      "type": "backend",
+      "label": "Python files",
+      "sublabel": "backend apps",
+      "stage": 0,
+      "row": 0,
+      "tag": ".py",
+      "sources": [
+        {
+          "path": "wiretap/graph.py",
+          "line": 76,
+          "label": "files()"
+        }
+      ]
+    },
+    {
+      "id": "tsfiles",
+      "type": "frontend",
+      "label": "TS / TSX files",
+      "sublabel": "web + mobile apps",
+      "stage": 0,
+      "row": 2,
+      "tag": ".ts .tsx",
+      "sources": [
+        {
+          "path": "wiretap/graph.py",
+          "line": 76,
+          "label": "files()"
+        }
+      ]
+    },
+    {
+      "id": "pyx",
+      "type": "backend",
+      "label": "py_extract",
+      "sublabel": "Python ast",
+      "stage": 1,
+      "row": 0,
+      "tag": "in-process",
+      "sources": [
+        {
+          "path": "wiretap/py_extract.py",
+          "line": 178,
+          "label": "ast.parse"
+        },
+        {
+          "path": "wiretap/py_extract.py",
+          "line": 321,
+          "label": "extract()"
+        }
+      ]
+    },
+    {
+      "id": "tsx",
+      "type": "frontend",
+      "label": "ts_extract",
+      "sublabel": "TS compiler API",
+      "stage": 1,
+      "row": 2,
+      "tag": "node child",
+      "sources": [
+        {
+          "path": "wiretap/ts_extract.mjs",
+          "line": 86,
+          "end_line": 88,
+          "label": "createSourceFile"
+        },
+        {
+          "path": "wiretap/graph.py",
+          "line": 209,
+          "label": "_run_ts"
+        }
+      ]
+    },
+    {
+      "id": "cache",
+      "type": "database",
+      "label": "extract.json",
+      "sublabel": ".wiretap-cache",
+      "stage": 2,
+      "row": 1,
+      "tag": "per file",
+      "sources": [
+        {
+          "path": "wiretap/graph.py",
+          "line": 140,
+          "end_line": 146,
+          "label": "save_cache"
+        },
+        {
+          "path": "wiretap/graph.py",
+          "line": 126,
+          "end_line": 127,
+          "label": "load_cache"
+        }
+      ]
+    },
+    {
+      "id": "linker",
+      "type": "backend",
+      "label": "Linker",
+      "sublabel": "imports, routes, tables",
+      "stage": 3,
+      "row": 1,
+      "tag": "graph.py",
+      "sources": [
+        {
+          "path": "wiretap/graph.py",
+          "line": 237,
+          "label": "_Linker"
+        },
+        {
+          "path": "wiretap/graph.py",
+          "line": 713,
+          "label": "match_route"
+        }
+      ]
+    },
+    {
+      "id": "api",
+      "type": "backend",
+      "label": "GET /api/graph",
+      "sublabel": "server.py",
+      "stage": 4,
+      "row": 0,
+      "tag": "JSON",
+      "sources": [
+        {
+          "path": "wiretap/server.py",
+          "line": 293,
+          "end_line": 295,
+          "label": "/api/graph"
+        }
+      ]
+    },
+    {
+      "id": "ui",
+      "type": "frontend",
+      "label": "Browser map",
+      "sublabel": "web/app.js",
+      "stage": 4,
+      "row": 2,
+      "tag": "SVG",
+      "sources": [
+        {
+          "path": "web/app.js",
+          "line": 1294,
+          "end_line": 1296,
+          "label": "loadGraph"
+        }
+      ]
+    }
+  ],
+  "flows": [
+    {
+      "id": "py-src",
+      "from": "pyfiles",
+      "to": "pyx",
+      "label": "source text",
+      "variant": "emphasis"
+    },
+    {
+      "id": "ts-src",
+      "from": "tsfiles",
+      "to": "tsx",
+      "label": "source text",
+      "variant": "emphasis"
+    },
+    {
+      "id": "py-facts",
+      "from": "pyx",
+      "to": "cache",
+      "label": "facts per file",
+      "classification": "functions, calls, routes"
+    },
+    {
+      "id": "ts-facts",
+      "from": "tsx",
+      "to": "cache",
+      "label": "facts per file",
+      "classification": "functions, fetches, JSX"
+    },
+    {
+      "id": "to-linker",
+      "from": "cache",
+      "to": "linker",
+      "label": "all files",
+      "variant": "emphasis"
+    },
+    {
+      "id": "graph",
+      "from": "linker",
+      "to": "api",
+      "label": "graph",
+      "classification": "nodes + edges"
+    },
+    {
+      "id": "fetch",
+      "from": "api",
+      "to": "ui",
+      "label": "fetch",
+      "variant": "dashed",
+      "labelDy": 25
+    }
+  ],
+  "cards": [
+    {
+      "dot": "emerald",
+      "title": "Only what changed",
+      "items": [
+        "A watcher compares file mtimes every second",
+        "Changed files are re-parsed; the rest come from extract.json",
+        "A cold index of 638 files took 1.7 s"
+      ]
+    },
+    {
+      "dot": "cyan",
+      "title": "Linking",
+      "items": [
+        "Imports and aliases resolve calls across files",
+        "API calls match backend routes by method and path",
+        "Supabase and SQLAlchemy calls become table reads and writes"
+      ]
+    },
+    {
+      "dot": "orange",
+      "title": "No running app",
+      "items": [
+        "Code is parsed, never executed",
+        "TypeScript is parsed without type checking",
+        "Calls through strings or DI can be missed and are counted"
+      ]
+    }
+  ]
+}
