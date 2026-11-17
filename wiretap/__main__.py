@@ -62,6 +62,11 @@ def _strip(settings):
     return settings
 
 
+def _short(path):
+    home = os.path.expanduser("~")
+    return "~" + path[len(home):] if path.startswith(home + os.sep) else path
+
+
 def install(path, port, dry):
     settings = {}
     if os.path.exists(path):
@@ -86,7 +91,7 @@ def install(path, port, dry):
             print(f"Backed up {path} -> {backup}")
     with open(path, "w") as fh:
         fh.write(text)
-    print(f"Installed Wiretap hooks in {path}. New Claude Code sessions will report to http://127.0.0.1:{port}")
+    print(f"Installed Wiretap hooks in {_short(path)}. New Claude Code sessions will report to http://127.0.0.1:{port}")
     print("They also get the \"Wiretap live\" button above the prompt and the /wiretap command.")
 
 
@@ -98,7 +103,20 @@ def uninstall(path):
         settings = json.load(fh)
     with open(path, "w") as fh:
         fh.write(json.dumps(_strip(settings), indent=2) + "\n")
-    print(f"Removed Wiretap hooks and the terminal button from {path}")
+    print(f"Removed Wiretap hooks and the terminal button from {_short(path)}")
+
+
+def _missing_folders(config):
+    """Print an error for a project root or app folder that doesn't exist (an unedited example config,
+    a typo) instead of serving an empty map. Returns True if any is missing."""
+    with open(config) as fh:
+        cfg = json.load(fh)
+    root = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(config)), cfg.get("root", ".")))
+    missing = [root] if not os.path.isdir(root) else [
+        p for p in (os.path.join(root, app["root"]) for app in cfg.get("apps", [])) if not os.path.isdir(p)]
+    for p in missing:
+        print(f"Folder not found: {p}\nSet \"root\" and each app's \"root\" in {config} (see docs/setup.md).", file=sys.stderr)
+    return bool(missing)
 
 
 def main(argv=None):
@@ -124,6 +142,8 @@ def main(argv=None):
     if a.cmd in (None, "serve", "index") and not os.path.exists(a.config):
         print(f"No config at {a.config}.\nCopy wiretap.config.example.json to wiretap.config.json and list your project's apps "
               "(see \"Configure your project\" in the README).", file=sys.stderr)
+        return 1
+    if a.cmd in (None, "serve", "index") and _missing_folders(a.config):
         return 1
     if a.cmd == "index":
         from .graph import Project

@@ -1,97 +1,136 @@
-# Wiretap
+<!-- Cards are generated from docs/assets/cards.json with repo-polish (tools/cards/cards.py). Regenerate after editing it. -->
 
-Listen in on Claude Code while it works on your codebase, and see how that codebase connects.
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/hero-dark.svg"/>
+  <img src="docs/assets/hero-light.svg" width="100%" alt="Wiretap. See your code connect. Watch Claude work. A live map of a codebase, from button to route to table, lit up by Claude Code's reads and edits. Example: asked whether admins can change the delivery partner, it draws tap Save, handlePartnerSave, admin.updateDeliveryPartner, PATCH /admin/orders/{orderId}/delivery-partner, AdminUpdateDeliveryPartner, from an index of 8704 links, 3831 functions and 638 files."/>
+</picture>
 
-Wiretap draws a live map of a project: apps → API routes → backend logic → tables → outside services. Drill down from apps to files to single functions, see what uses something and what it affects, trace a feature across every app, and watch Claude Code's reads and edits light up on the map as they happen. When Claude only answers a question, it shows the flows Claude followed to find the answer.
+<p align="center">
+  <a href="#-see-it-work"><b>Demo</b></a> &nbsp;·&nbsp;
+  <a href="#-how-it-works"><b>Architecture</b></a> &nbsp;·&nbsp;
+  <a href="#-run-it"><b>Run it</b></a> &nbsp;·&nbsp;
+  <a href="docs/"><b>Docs</b></a> &nbsp;·&nbsp;
+  <a href="#-whats-next"><b>What's next</b></a>
+</p>
 
-It reads Python (FastAPI, Supabase, SQLAlchemy) and TypeScript / React / React Native. Everything runs locally and costs no tokens.
+Built while working on a six-app delivery platform (customer web and mobile apps, an admin console, a rider app and two backends), to see where a change lands before making it, and what Claude Code read and changed while making it.
 
-## Start
+## ▸ See it work
 
-Needs Python 3.10+ and Node.
+<p align="center">
+  <img src="docs/demo.gif" width="760" alt="Wiretap's Live view replays a recorded Claude Code session that checked whether a new delivery provider fits the architecture: rows appear one flow at a time with numbered boxes, from a Payment tap through createOrder and POST /orders to the instant-dispatch service and Shadowfax functions. One flow is isolated, a function is opened to show where its flow starts and its code, then the System view shows six apps and their backends, and a search opens admin.updateDeliveryPartner."/>
+</p>
+<p align="center"><sub>Real index of a six-app project (638 files). The Live part replays a recorded Claude Code session (prompt typos tidied).</sub></p>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/capabilities-dark.svg"/>
+  <img src="docs/assets/capabilities-light.svg" width="100%" alt="What you can do: see the whole system; know what a change hits, traced back to the tap or route that starts it; watch Claude Code work, with questions drawn as one row per flow; follow a feature by its words across all apps."/>
+</picture>
+
+## ▸ How it works
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/architecture-dark.svg"/>
+  <img src="docs/assets/architecture-light.svg" width="100%" alt="Architecture: the browser UI and the terminal button talk to one local server on 127.0.0.1:7878 over HTTP and server-sent events. Inside it, py_extract and ts_extract parse your codebase, graph.py links routes, calls and tables and keeps .wiretap-cache, and session.py turns Claude Code hooks into a timeline."/>
+</picture>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/flow-dark.svg"/>
+  <img src="docs/assets/flow-light.svg" width="100%" alt="One Claude tool call, end to end: the hook fires a curl, the server reads the tool call, line ranges and grep hits become functions, changed functions are diffed by hash and their callers found, the result is pushed over SSE, and the browser draws it."/>
+</picture>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/decisions-dark.svg"/>
+  <img src="docs/assets/decisions-light.svg" width="100%" alt="Why it's built this way: watching costs no tokens; code is read, not run; diffs are per function; API calls are matched to routes; summaries only run on click."/>
+</picture>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/editor-dark.svg"/>
+  <img src="docs/assets/editor-light.svg" width="100%" alt="wiretap/__main__.py lines 23 to 26: hook_command returns a shell command that skips when WIRETAP_SKIP is set, otherwise posts the hook payload with curl and a one second timeout to /api/hook, and always exits 0."/>
+</picture>
+
+More detail, with diagrams of a tool call and of indexing: [docs/architecture.md](docs/architecture.md).
+
+## ▸ Built with
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/stack-dark.svg"/>
+  <img src="docs/assets/stack-light.svg" width="100%" alt="Built with the Python standard library, the TypeScript compiler on Node.js, and plain JavaScript and SVG. It reads FastAPI, SQLAlchemy and Supabase on the Python side, and React, Expo / React Native and Supabase JS on the TypeScript side."/>
+</picture>
+
+## ▸ Run it
+
+You need Python 3.11+ (tested on 3.11 to 3.15), Node.js (tested on 24.16) and curl. Claude Code is optional: without it you still get every view except Live.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/terminal-dark.svg"/>
+  <img src="docs/assets/terminal-light.svg" width="100%" alt="Terminal: clone the repository, npm install, copy the example config, start the server, which reports 638 files, 3831 functions and 8704 links indexed in 1.7 seconds and the address to open, then install the Claude Code hooks."/>
+</picture>
+
+**1 · Install and point it at your project**
 
 ```bash
 git clone https://github.com/Aryan-yadav15/wiretap && cd wiretap
-npm install                                         # TypeScript, used to parse .ts/.tsx
-cp wiretap.config.example.json wiretap.config.json  # then point it at your project (below)
-python3 -m wiretap serve --open                     # http://127.0.0.1:7878
+npm install
+cp wiretap.config.example.json wiretap.config.json
 ```
 
-On a project of about 640 files, the first index takes about 2 seconds. After that it is cached in `.wiretap-cache/` and the server re-reads only the files that change (it checks every second, which costs about 3 ms).
+Edit `wiretap.config.json`: set `root` to your project folder and list its apps (a TypeScript frontend and a FastAPI backend are in the example). Every key is described in [docs/setup.md](docs/setup.md#configuration).
 
-## Connect Claude Code (one time)
+**2 · Start the map** → http://127.0.0.1:7878
 
 ```bash
-python3 -m wiretap install-hooks      # adds hooks to ~/.claude/settings.json (backup: settings.json.before-wiretap)
-python3 -m wiretap install-hooks --dry-run   # show what would be written
-python3 -m wiretap uninstall-hooks    # remove them again
+python3 -m wiretap serve --open
 ```
 
-The hooks are one `curl` to `127.0.0.1:7878` per tool call. They cost **no tokens**, finish in milliseconds, and do nothing when the server isn't running. Claude never reads the map. The map only watches.
+**3 · Connect Claude Code (once)**
 
-Start a new Claude Code session after installing, then open the **Live** tab.
+```bash
+python3 -m wiretap install-hooks
+```
 
-The same command adds a **◉ Wiretap live ↗** button above the Claude Code prompt (and a `/wiretap` command). Press it to open that session's Live view in your browser. If the server isn't running, it starts it first. Neither one uses tokens. The button is a Claude Code mod in `claude-mod/wiretap-live`, loaded through `CLAUDE_CODE_PLUGIN_DIRS` in your settings.
+This adds the hooks to `~/.claude/settings.json` (after a backup) and the **◉ Wiretap live ↗** button above the Claude Code prompt, plus `/wiretap`. Start a new Claude Code session, press the button, and the Live view opens on that session. `python3 -m wiretap uninstall-hooks` removes all of it.
 
-## Views
+<details>
+<summary><b>The views</b></summary>
 
 | View | What it answers |
 |---|---|
-| **System** | Which apps talk to which backends, databases and outside services, with counts. Also shows how complete the map is (unmatched API calls, calls it could not follow). |
-| **Map** | Focus on one file, table, service or resource. Amber = uses it, teal = it reaches. Click a box to move, click the focused box to look inside, click a line to see the exact calls behind it. Depth 1–3. |
-| **Inside a file** | Functions in the file, who calls in and what they call out to. Click a function: its callers, its calls, **where the flow starts** (button tap, screen opening, API route, startup or scheduled job), how many files sit upstream, and its code. |
-| **Live** | The Claude session as it happens: files read, the plan (dashed), files created and edited (with the number of functions changed), files that call changed code (amber), edits **outside the plan** (red !), test results, and a timeline. The summary is computed by the map (0 tokens). **Summarize with Claude** runs `claude -p --model haiku` on the git diff, only when clicked. Your own edits show up under "Your own edits". When Claude only answers a question (reads, changes nothing), Live draws **one row per flow** Claude followed, left to right from where it starts (button, screen, route) to the tables it touches, with ①②③ for the order it looked. Flows that share a start branch off; many small calls between two files fold into one row; other reads sit under "Also read". Solid = read, dashed = only a search matched it. Click a row title to show just that flow, **▶ Replay** steps through the session, and `&step=N` in the URL freezes it at a step. Reads and searches done through the shell (`grep -rn`, `sed -n 10,40p`) count too, down to the function. |
-| **Trace** | Type the words a feature uses (`cod, pay_later, payLater`). It finds every function that mentions them as an identifier (`cod` matches `isCod` and `cod_fee`, not `code`), plus functions that touch the same feature-specific tables without using the words. |
-| **Resources** | Shared things that can cause a stall: the 40-thread worker pool, the shared Supabase client, the SQLAlchemy session pool. Who uses each one, and what else those functions share. |
+| **System** | Which apps talk to which backends, databases and outside services, with counts, and how complete the map is (unmatched API calls, calls it couldn't follow). |
+| **Map** | One file, table, service or resource in focus. Amber = uses it, teal = it reaches. Click a box to move, click the focused box to look inside, click a line to see the calls behind it. |
+| **Inside a file** | Its functions, who calls in and what they call out to. Click a function for its callers, its calls, **where the flow starts** (a tap, a screen opening, an API route, startup or a scheduled job), and its code. |
+| **Live** | The Claude session as it happens: files read, the plan, edits with the functions changed, files that call changed code, edits outside the plan, test results, a timeline. A question-only session is drawn as one row per flow, numbered in the order Claude looked, with **Replay**. **Summarize with Claude** runs `claude -p --model haiku` on the diff only when pressed. Your own edits show up too. |
+| **Trace** | Type the words a feature uses (`cod, pay_later, payLater`). Finds every function that uses them as an identifier, plus functions that touch the same feature-specific tables. |
+| **Resources** | Shared things that can stall everything: the worker thread pool, a shared database client, a session pool. Who uses each one. |
 
-Press `/` to search for any file, function, route or table.
+Press `/` anywhere to search for a file, function, route or table.
 
-## What it understands
+</details>
 
-- **Python / FastAPI**: functions, methods and nested functions; imports (including relative ones); `APIRouter(prefix=…)` and `include_router(…, prefix=…)` chains; route decorators; Supabase `.table("x").select/insert/update/…` (read vs write) and `.rpc()`; SQLAlchemy models via `__tablename__`; `run_in_threadpool`, `asyncio.to_thread`, sync `def` endpoints (these use the thread pool too); `on_event("startup")`, `create_task`, `add_job`, `BackgroundTasks.add_task`; outside SDKs (Razorpay, Firebase, …) and HTTP calls to known hosts.
-- **TypeScript / React / React Native**: functions, components, handlers nested in components, object-of-functions exports (`admin.getZones`), class instances (`orderService.getMyOrders`), re-exports, `@/` aliases; `api.get/post/…` and `fetch` calls with URLs from literals, template strings and constants like `API_ENDPOINTS.X(id)`; JSX `onClick` / `onPress` handlers (with the button text); `<Component/>` renders; direct `supabase.from("table")` calls; hooks like `const { addItem } = useCart()` (marked as a guess).
-- Each API call in an app is matched to its backend route (method + path, `{param}` aware). Calls that hit no route are listed under System.
-
-## Limits
-
-- It reads code. It doesn't run it. Calls made through strings, dependency injection or runtime config may be missing, and the map counts them under "Calls the map could not follow" (Redux `dispatch`, websocket managers, etc.).
-- "Who held the thread pool during the crash" needs runtime data (request timing, `py-spy dump`, `pg_stat_activity`). The Resources view shows who *could* be involved.
-- Planned files come from file names in Claude's plan. Vague plans produce fewer dashed boxes.
-- The live session lives in memory. Restarting the server clears it (the code index is cached).
-
-## Configure your project
-
-`wiretap.config.json` (kept out of git) says where the project is and which apps it has:
-
-| Key | Meaning |
-|---|---|
-| `root` | The project folder, relative to the Wiretap folder |
-| `apps[].lang` | `ts` for TypeScript/JavaScript apps, `py` for Python backends |
-| `apps[].root`, `include` | The app's folder inside the project, and which folders in it to read |
-| `httpClients` | Names of the HTTP client objects the app calls (`api.get(...)`) |
-| `backend`, `pathPrefix` | Which backend app those calls go to, and any prefix the client adds |
-| `alias` | Import aliases such as `@/` → `src/` |
-| `db` | For a backend: its database, and the name for its shared client |
-| `typescript` | Optional: a `node_modules/typescript` folder to use instead of Wiretap's own |
-
-A frontend talking to one FastAPI backend is in `wiretap.config.example.json`. Use another file with `python3 -m wiretap --config path/to/config.json serve`.
-
-## Tests
-
-```bash
-python3 -m unittest discover -s tests -v
-```
-
-They index a small fixture project and replay a Claude session (prompt → read → plan → edit → off-plan edit → tests → stop) through the hook handler and the HTTP API.
-
-## Files
+<details>
+<summary><b>Project structure</b></summary>
 
 ```
-wiretap/py_extract.py   Python parser (ast)
-wiretap/ts_extract.mjs  TypeScript parser (TypeScript compiler API, no type checking)
-wiretap/graph.py        links everything: imports, routes, HTTP matching, tables, resources, entry points
-wiretap/session.py      hook events → session timeline, function-level diffs, plan, tests
-wiretap/server.py       HTTP + server-sent events, file watcher, trace search, on-demand summary
-web/                    the UI (plain HTML/CSS/JS, no build step)
-claude-mod/wiretap-live the terminal button + /wiretap (Claude Code mod)
+wiretap/                    the server: CLI, parsers, linker, sessions, HTTP + SSE
+web/                        the UI (plain HTML, CSS, JS; no build step)
+claude-mod/wiretap-live/    Claude Code mod: the button above the prompt and /wiretap
+tests/                      unittest suite and a small fixture project
+docs/                       architecture, codebase, setup, API, decisions; cards and diagrams
 ```
+
+Folder-by-folder detail: [docs/codebase.md](docs/codebase.md). Run the tests with `python3 -m unittest discover -s tests -v`.
+
+</details>
+
+## ▸ What's next
+
+- **Only Python and TypeScript.** Other backends (Go, Java, Node servers) aren't parsed, and HTTP matching expects FastAPI-style route decorators. A parser per language would plug into the same per-file format.
+- **Static analysis has blind spots.** Calls through strings, dependency injection, Redux `dispatch` or websocket managers can't be followed. They're counted in the System view (252 on the project above) rather than hidden.
+- **Live sessions live in memory.** Restarting the server clears them. Writing them next to the cache would keep history across restarts.
+- **The terminal button assumes port 7878.** `serve --port` and `install-hooks --port` move the server and hooks, but not the button.
+- **No runtime data.** The Resources view shows who *could* hold the thread pool or the database client. Overlaying real request timings would show who *did*.
+- **Planning on the map.** Sketching planned files and functions as dashed boxes before any code is written (to compare an adapter with code inside an existing module, for example) isn't built yet.
+
+<sub>Full documentation: [docs/](docs/) — [architecture](docs/architecture.md) · [codebase](docs/codebase.md) · [setup](docs/setup.md) · [API](docs/api.md) · [decisions](docs/decisions/)</sub>
+
+<sub>MIT licensed. See [LICENSE](LICENSE).</sub>
