@@ -85,6 +85,7 @@ Each entry in `apps`:
 | Symptom | Cause | Fix |
 |---|---|---|
 | `No config at …/wiretap.config.json` | no config yet | `cp wiretap.config.example.json wiretap.config.json` and edit it |
+| `Folder not found: …` | `root` or an app's `root` in the config points nowhere (for example the unedited example config) | fix the paths; `root` is relative to the config file, app roots to `root` |
 | `<app>: TypeScript not found` | no TypeScript where Wiretap looks | run `npm install` in the Wiretap folder, or set `typescript` / `WIRETAP_TYPESCRIPT` |
 | Many "API calls with no matching route" in System | wrong `backend` or `pathPrefix`, or routes declared in a way Wiretap doesn't read | check `pathPrefix` against what the client adds; `python3 -m wiretap index` lists each unmatched call with its file and line |
 | Live stays on "Waiting for this Claude session" | hooks not installed, or the session started before installing | `python3 -m wiretap install-hooks`, then start a new Claude Code session |

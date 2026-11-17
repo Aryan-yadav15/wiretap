@@ -106,6 +106,19 @@ def uninstall(path):
     print(f"Removed Wiretap hooks and the terminal button from {_short(path)}")
 
 
+def _missing_folders(config):
+    """Print an error for a project root or app folder that doesn't exist (an unedited example config,
+    a typo) instead of serving an empty map. Returns True if any is missing."""
+    with open(config) as fh:
+        cfg = json.load(fh)
+    root = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(config)), cfg.get("root", ".")))
+    missing = [root] if not os.path.isdir(root) else [
+        p for p in (os.path.join(root, app["root"]) for app in cfg.get("apps", [])) if not os.path.isdir(p)]
+    for p in missing:
+        print(f"Folder not found: {p}\nSet \"root\" and each app's \"root\" in {config} (see docs/setup.md).", file=sys.stderr)
+    return bool(missing)
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="wiretap", description="Visual map of how a codebase connects, live while Claude Code works.")
     ap.add_argument("--config", default=os.environ.get("WIRETAP_CONFIG", DEFAULT_CONFIG))
@@ -129,6 +142,8 @@ def main(argv=None):
     if a.cmd in (None, "serve", "index") and not os.path.exists(a.config):
         print(f"No config at {a.config}.\nCopy wiretap.config.example.json to wiretap.config.json and list your project's apps "
               "(see \"Configure your project\" in the README).", file=sys.stderr)
+        return 1
+    if a.cmd in (None, "serve", "index") and _missing_folders(a.config):
         return 1
     if a.cmd == "index":
         from .graph import Project
