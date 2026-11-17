@@ -62,6 +62,11 @@ def _strip(settings):
     return settings
 
 
+def _short(path):
+    home = os.path.expanduser("~")
+    return "~" + path[len(home):] if path.startswith(home + os.sep) else path
+
+
 def install(path, port, dry):
     settings = {}
     if os.path.exists(path):
@@ -86,7 +91,7 @@ def install(path, port, dry):
             print(f"Backed up {path} -> {backup}")
     with open(path, "w") as fh:
         fh.write(text)
-    print(f"Installed Wiretap hooks in {path}. New Claude Code sessions will report to http://127.0.0.1:{port}")
+    print(f"Installed Wiretap hooks in {_short(path)}. New Claude Code sessions will report to http://127.0.0.1:{port}")
     print("They also get the \"Wiretap live\" button above the prompt and the /wiretap command.")
 
 
@@ -98,7 +103,7 @@ def uninstall(path):
         settings = json.load(fh)
     with open(path, "w") as fh:
         fh.write(json.dumps(_strip(settings), indent=2) + "\n")
-    print(f"Removed Wiretap hooks and the terminal button from {path}")
+    print(f"Removed Wiretap hooks and the terminal button from {_short(path)}")
 
 
 def main(argv=None):
