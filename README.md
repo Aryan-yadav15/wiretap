@@ -67,15 +67,20 @@ You need Python 3.11+ (tested on 3.11 to 3.15), Node.js (tested on 24.16) and cu
   <img src="docs/assets/terminal-light.svg" width="100%" alt="Terminal: clone the repository, npm install, copy the example config, start the server, which reports 638 files, 3831 functions and 8704 links indexed in 1.7 seconds and the address to open, then install the Claude Code hooks."/>
 </picture>
 
-**1 · Install and point it at your project**
+**1 · Install**
 
 ```bash
 git clone https://github.com/Aryan-yadav15/wiretap && cd wiretap
 npm install
-cp wiretap.config.example.json wiretap.config.json
 ```
 
-Edit `wiretap.config.json`: set `root` to your project folder and list its apps (a TypeScript frontend and a FastAPI backend are in the example). Every key is described in [docs/setup.md](docs/setup.md#configuration).
+No config is needed: the first time Claude Code works in a folder, Wiretap maps it (one app per `package.json` and per `pyproject.toml` / `requirements.txt`, up to 5,000 files), and each project gets its own map. To fix the apps, routes and prefixes for one project, or map it before Claude touches it, write a config:
+
+```bash
+cp wiretap.config.example.json wiretap.config.json   # set root and list the apps
+```
+
+Every key is described in [docs/setup.md](docs/setup.md#configuration).
 
 **2 · Start the map** → http://127.0.0.1:7878
 
@@ -99,11 +104,13 @@ This adds the hooks to `~/.claude/settings.json` (after a backup) and the **◉ 
 | **System** | Which apps talk to which backends, databases and outside services, with counts, and how complete the map is (unmatched API calls, calls it couldn't follow). |
 | **Map** | One file, table, service or resource in focus. Amber = uses it, teal = it reaches. Click a box to move, click the focused box to look inside, click a line to see the calls behind it. |
 | **Inside a file** | Its functions, who calls in and what they call out to. Click a function for its callers, its calls, **where the flow starts** (a tap, a screen opening, an API route, startup or a scheduled job), and its code. |
-| **Live** | The Claude session as it happens: files read, the plan, edits with the functions changed, files that call changed code, edits outside the plan, test results, a timeline. A question-only session is drawn as one row per flow, numbered in the order Claude looked, with **Replay**. **Summarize with Claude** runs `claude -p --model haiku` on the diff only when pressed. Your own edits show up too. |
+| **Live** | The Claude session as it happens, in whichever project Claude is working in. Steps are grouped into phases (looking around, changing code, checking, done) and each step is told in plain words; step through them with ← → or **Replay**, and the map shows the files as they were at that step: green = edited (numbered in edit order), yellow = uses changed code, flashing = touched last. "The story so far" lists the phases. A question-only session is drawn as one row per flow, numbered in the order Claude looked. **Summarize with Claude** runs `claude -p --model haiku` on the diff only when pressed. Your own edits show up too. |
 | **Trace** | Type the words a feature uses (`cod, pay_later, payLater`). Finds every function that uses them as an identifier, plus functions that touch the same feature-specific tables. |
 | **Resources** | Shared things that can stall everything: the worker thread pool, a shared database client, a session pool. Who uses each one. |
 
-Press `/` anywhere to search for a file, function, route or table.
+On every map: drag a box to move it, drag a column's background to move the whole column, shift-drag on empty space to pick several boxes and drag them together, scroll to pan, ⌘ / Ctrl + scroll to zoom. **Reset layout** puts everything back. The sidebar, the side panel and the canvas height can be resized or collapsed, and panel sections fold; those sizes are remembered.
+
+Keys: `/` search, `[` `]` hide the sidebar or the panel, `F` fit the map, and on Live ← → step, `R` replay. When more than one project is mapped, pick one at the top of the sidebar.
 
 </details>
 
@@ -124,9 +131,10 @@ Folder-by-folder detail: [docs/codebase.md](docs/codebase.md). Run the tests wit
 
 ## ▸ What's next
 
-- **Only Python and TypeScript.** Other backends (Go, Java, Node servers) aren't parsed, and HTTP matching expects FastAPI-style route decorators. A parser per language would plug into the same per-file format.
+- **Only Python and TypeScript.** Other backends (Go, Java, Node servers) aren't parsed, and HTTP matching expects FastAPI-style route decorators. Stylesheets are read rule by rule (so Live can say which rules changed), but not linked to the components that use them. A parser per language would plug into the same per-file format.
 - **Static analysis has blind spots.** Calls through strings, dependency injection, Redux `dispatch` or websocket managers can't be followed. They're counted in the System view (252 on the project above) rather than hidden.
-- **Live sessions live in memory.** Restarting the server clears them. Writing them next to the cache would keep history across restarts.
+- **Live sessions live in memory.** Restarting the server clears them, and projects mapped on the fly are mapped again (from their cache) when Claude next works there. Writing sessions next to the cache would keep history across restarts.
+- **Moved boxes aren't saved.** Dragged positions last until the page reloads (panel sizes and folds are remembered, box positions are not).
 - **The terminal button assumes port 7878.** `serve --port` and `install-hooks --port` move the server and hooks, but not the button.
 - **No runtime data.** The Resources view shows who *could* hold the thread pool or the database client. Overlaying real request timings would show who *did*.
 - **Planning on the map.** Sketching planned files and functions as dashed boxes before any code is written (to compare an adapter with code inside an existing module, for example) isn't built yet.
