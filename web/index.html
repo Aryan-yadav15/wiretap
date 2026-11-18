@@ -6,36 +6,54 @@
 <title>Wiretap</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Schibsted+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist+Mono:wght@400;500;600;700&display=swap">
 <link rel="stylesheet" href="/style.css">
 </head>
 <body>
-<div class="wrap">
-  <div class="top">
-    <div class="brand"><h1>Wiretap</h1><span class="proj" id="proj"></span></div>
-    <div class="seg" role="group" aria-label="View" id="views">
-      <button data-v="system">System</button>
-      <button data-v="map">Map</button>
-      <button data-v="live" id="live-tab">Live</button>
-      <button data-v="trace">Trace</button>
-      <button data-v="resources">Resources</button>
-    </div>
+<header class="top">
+  <div class="brand">
+    <svg class="logo" viewBox="0 0 32 32" aria-hidden="true"><rect x="3" y="4" width="11" height="9" rx="2"/><rect x="18" y="4" width="11" height="9" rx="2"/><rect x="10.5" y="19" width="11" height="9" rx="2"/><path d="M8.5 13v3h15v-3M16 16v3"/></svg>
+    <h1>Wire<mark>tap</mark></h1>
+  </div>
+  <nav class="tabs" role="group" aria-label="View" id="views">
+    <button data-v="system"><svg viewBox="0 0 16 16"><rect x="1.5" y="2" width="5" height="5" rx="1"/><rect x="9.5" y="2" width="5" height="5" rx="1"/><rect x="5.5" y="9.5" width="5" height="5" rx="1"/></svg>System</button>
+    <button data-v="map"><svg viewBox="0 0 16 16"><circle cx="4" cy="4" r="2"/><circle cx="12" cy="8" r="2"/><circle cx="4" cy="12" r="2"/><path d="M6 4.5l4 2.5M6 11.5l4-2.5"/></svg>Map</button>
+    <button data-v="live" id="live-tab"><svg viewBox="0 0 16 16"><circle cx="8" cy="8" r="2.2"/><path d="M4.2 4.2a5.4 5.4 0 0 0 0 7.6M11.8 4.2a5.4 5.4 0 0 1 0 7.6"/></svg><span>Live</span></button>
+    <button data-v="trace"><svg viewBox="0 0 16 16"><circle cx="7" cy="7" r="4.5"/><path d="M10.5 10.5l4 4"/></svg>Trace</button>
+    <button data-v="resources"><svg viewBox="0 0 16 16"><ellipse cx="8" cy="4" rx="5.5" ry="2"/><path d="M2.5 4v8c0 1.1 2.5 2 5.5 2s5.5-.9 5.5-2V4M2.5 8c0 1.1 2.5 2 5.5 2s5.5-.9 5.5-2"/></svg>Resources</button>
+  </nav>
+  <div class="top-r">
     <div class="search">
-      <input id="q" type="search" placeholder="Find a file, function, route or table  ( / )" autocomplete="off" aria-label="Search">
+      <svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="7" cy="7" r="4.5"/><path d="M10.5 10.5l4 4"/></svg>
+      <input id="q" type="search" placeholder="Find a file, function, route…" autocomplete="off" aria-label="Search">
+      <kbd>/</kbd>
       <div class="results" id="results" hidden></div>
     </div>
+    <button class="icon-btn" id="theme" aria-label="Switch light or dark"><svg viewBox="0 0 16 16"><path d="M13.5 9.5A5.5 5.5 0 0 1 6.5 2.5a5.5 5.5 0 1 0 7 7z"/></svg></button>
     <span class="status" id="status"><i></i><span>connecting</span></span>
   </div>
-  <div class="main">
-    <div class="card">
-      <nav class="crumbs" id="crumbs" aria-label="Path"></nav>
-      <div class="readout" id="readout" aria-live="polite"></div>
+</header>
+<div class="shell">
+  <aside class="side" id="side" aria-label="Project"></aside>
+  <main class="card work">
+    <div class="drag-x l" data-r="sw" title="Drag to resize"></div><div class="drag-x r" data-r="pw" title="Drag to resize"></div>
+    <div class="head">
+      <div class="head-l">
+        <nav class="crumbs" id="crumbs" aria-label="Path"></nav>
+        <h2 class="title" id="title"></h2>
+        <div class="readout" id="readout" aria-live="polite"></div>
+      </div>
+      <div class="chips" id="chips"></div>
+    </div>
+    <div class="canvas">
       <div class="tools" id="tools" hidden></div>
-      <div class="scroll" id="scroll"><svg id="svg" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Map"></svg><div id="empty"></div></div>
+      <div class="scroll" id="scroll"><svg id="svg" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Map"></svg><div id="empty"></div><div class="cv-tools" id="cvtools"></div></div>
+      <div class="drag-y" data-r="ch" title="Drag to change the canvas height"></div>
       <div class="legend" id="legend"></div>
     </div>
-    <aside class="card panel" id="panel"></aside>
-  </div>
+    <section class="stepper" id="stepper" hidden></section>
+  </main>
+  <aside class="card panel" id="panel"></aside>
 </div>
 <script src="/app.js"></script>
 </body>

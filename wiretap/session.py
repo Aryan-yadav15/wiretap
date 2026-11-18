@@ -5,12 +5,14 @@ import re
 import time
 from collections import defaultdict, deque
 
+from .style_extract import STYLE_EXT
+
 TEST_CMD = re.compile(r"\b(pytest|jest|vitest|npm (run )?test|yarn test|pnpm test|python -m unittest|go test|cargo test)\b")
 PYTEST_SUMMARY = re.compile(r"(?:(\d+) failed)?[ ,]*(?:(\d+) passed)?[ ,]*(?:(\d+) error)?", re.I)
-FILE_MENTION = re.compile(r"[\w@./-]+\.(?:py|tsx|ts|jsx|js|mjs)\b")
+FILE_MENTION = re.compile(r"[\w@./-]+\.(?:py|tsx|ts|jsx|js|mjs|css|scss|sass|less|html)\b")
 # grep/rg output lines start with "path:line:" or are bare paths (grep -l)
-HIT_LINE = re.compile(r"^(?:\./)?([\w@./-]+\.(?:py|tsx|ts|jsx|js|mjs))(?::\d+[:-]|:|$)", re.M)
-HIT_AT = re.compile(r"^(?:\./)?([\w@./-]+\.(?:py|tsx|ts|jsx|js|mjs))[:-](\d+)[:-]", re.M)
+HIT_LINE = re.compile(r"^(?:\./)?([\w@./-]+\.(?:py|tsx|ts|jsx|js|mjs|css|scss|sass|less|html))(?::\d+[:-]|:|$)", re.M)
+HIT_AT = re.compile(r"^(?:\./)?([\w@./-]+\.(?:py|tsx|ts|jsx|js|mjs|css|scss|sass|less|html))[:-](\d+)[:-]", re.M)
 LINE_ONLY = re.compile(r"^(\d+)[:-]", re.M)          # grep -n on a single file
 SED_RANGE = re.compile(r"\bsed\s+-n\s+['\"]?(\d+)(?:,(\d+))?p")
 HEAD_N = re.compile(r"\bhead\s+-(?:n\s*)?(\d+)\b")
@@ -244,7 +246,8 @@ class Sessions:
                     picked += [g for g in inside if not any(h is not g and h in inside and h["line"] <= g["line"] and h["end"] >= g["end"] for h in inside)] or [f]
                 else:
                     picked.append(f)
-            if 0 < len(picked) <= 6:
+            # CSS rules are a line or two each, so a short read of a stylesheet still names them
+            if 0 < len(picked) <= (12 if rel.endswith(STYLE_EXT) else 6):
                 out += [f["name"] for f in picked]
         return list(dict.fromkeys(out))
 

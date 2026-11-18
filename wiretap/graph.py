@@ -20,7 +20,7 @@ import subprocess
 import time
 from collections import defaultdict
 
-from . import py_extract
+from . import py_extract, style_extract
 
 DEFAULT_EXTERNALS_PY = {
     "razorpay": "Razorpay", "firebase_admin": "Firebase", "boto3": "AWS", "botocore": "AWS",
@@ -47,9 +47,65 @@ SKIP_DIRS = {"node_modules", "venv", ".venv", "__pycache__", "dist", "build", ".
              "coverage", ".next", "migrations", "alembic", "__tests__", "tests", "test"}
 
 LANES = [
-    ("screen", "Screens"), ("ui", "Components"), ("client", "Client logic"), ("route", "API routes"),
+    ("screen", "Screens"), ("ui", "Components"), ("style", "Styles"), ("client", "Client logic"), ("route", "API routes"),
     ("logic", "Backend logic"), ("data", "Data"), ("outside", "Outside"),
 ]
+
+
+MAX_AUTO_FILES = 5000
+PY_MARKERS = ("pyproject.toml", "requirements.txt", "setup.py", "manage.py", "Pipfile")
+
+
+def autodetect(root):
+    """A config for a folder that has none: one TypeScript app per package.json folder and one Python app per
+    pyproject / requirements folder (the innermost ones, so a monorepo's packages each get their own).
+    Returns (cfg, reason): cfg has no apps, and reason says why, for a home folder, a folder with no code,
+    or one too big to index on the fly."""
+    root = os.path.normpath(root)
+    name = os.path.basename(root) or root
+    empty = lambda why: ({"name": name, "root": root, "apps": []}, why)
+    if root in (os.path.expanduser("~"), "/"):
+        return {"name": "Home folder", "root": root, "apps": []}, "This is your home folder, not a project. Start Claude Code inside a project folder to see its map."
+    found = {"ts": [], "py": []}
+    for dp, dns, fns in os.walk(root):
+        depth = 0 if dp == root else os.path.relpath(dp, root).count(os.sep) + 1
+        dns[:] = [d for d in dns if d not in SKIP_DIRS and not d.startswith(".")] if depth < 4 else []
+        if "package.json" in fns:
+            found["ts"].append(dp)
+        if any(m in fns for m in PY_MARKERS):
+            found["py"].append(dp)
+    # keep the innermost folders: a parent package.json is a workspace, not an app
+    pick = {k: [d for d in v if not any(o != d and o.startswith(d + os.sep) for o in v)] for k, v in found.items()}
+    # no marker for a language: try the whole folder (dropped below if it has no files of that kind)
+    pick = {k: v or [root] for k, v in pick.items()}
+    apps, ids = [], set()
+    for lang in ("py", "ts"):
+        for d in sorted(pick[lang]):
+            rel = os.path.relpath(d, root)
+            label = name if rel == "." else os.path.basename(d)
+            if lang == "ts":
+                try:
+                    with open(os.path.join(d, "package.json")) as fh:
+                        label = json.load(fh).get("name") or label
+                except (OSError, ValueError):
+                    pass
+            base_id = re.sub(r"[^a-z0-9]+", "-", os.path.basename(d).lower()).strip("-") or lang
+            aid = base_id if base_id not in ids else f"{base_id}-{lang}"
+            app = {"id": aid, "name": label, "lang": lang, "root": rel}
+            if not App(app, root).files():
+                continue
+            ids.add(aid)
+            apps.append(app)
+    if not apps:
+        return empty("No Python or TypeScript/JavaScript files found here.")
+    py = [a["id"] for a in apps if a["lang"] == "py"]
+    for a in apps:
+        if a["lang"] == "ts" and len(py) == 1:
+            a["backend"] = py[0]
+    total = sum(len(App(a, root).files()) for a in apps)
+    if total > MAX_AUTO_FILES:
+        return empty(f"{total} code files is too many to map on the fly. Give it a wiretap.config.json instead.")
+    return {"name": name, "root": root, "apps": apps}, None
 
 
 def norm_path(p):
@@ -74,7 +130,7 @@ class App:
         self.stamp = {}     # rel -> (mtime, size)
 
     def files(self):
-        exts = (".py",) if self.lang == "py" else TS_EXT
+        exts = (".py",) if self.lang == "py" else TS_EXT + style_extract.STYLE_EXT + style_extract.MARKUP_EXT
         skip = SKIP_DIRS | set(self.cfg.get("skipDirs", []))
         out = []
         for inc in self.include:
@@ -95,11 +151,14 @@ class App:
 
 
 class Project:
-    def __init__(self, config_path):
-        with open(config_path) as fh:
-            self.cfg = json.load(fh)
+    def __init__(self, config_path=None, cfg=None, cache_dir=None):
+        """From a config file, or (cfg, cache_dir) for a project Wiretap set up by itself (see autodetect)."""
+        if cfg is None:
+            with open(config_path) as fh:
+                cfg = json.load(fh)
+        self.cfg = cfg
         self.config_path = config_path
-        base = os.path.dirname(os.path.abspath(config_path))
+        base = os.path.dirname(os.path.abspath(config_path)) if config_path else "/"
         self.root = os.path.normpath(os.path.join(base, self.cfg.get("root", ".")))
         self.apps = [App(a, self.root) for a in self.cfg["apps"]]
         self.app_by_id = {a.id: a for a in self.apps}
@@ -108,7 +167,7 @@ class Project:
         self.ext_py = {**DEFAULT_EXTERNALS_PY, **self.cfg.get("externalsPython", {})}
         self.ext_ts = {**DEFAULT_EXTERNALS_TS, **self.cfg.get("externalsJs", {})}
         self.hosts = {**DEFAULT_HOSTS, **self.cfg.get("hosts", {})}
-        self.cache_dir = os.path.join(base, ".wiretap-cache")
+        self.cache_dir = cache_dir or os.path.join(base, ".wiretap-cache")
         self.graph = None
         self.version = 0
         self.timings = {}
@@ -182,7 +241,20 @@ class Project:
                     a.stamp[rel] = stamp
                     changed.append((a.id, rel, old, a.extract[rel]))
             else:
-                results = self._run_ts(a, [r for r, _ in todo])
+                # stylesheets and HTML are read here; only code goes to the TypeScript parser
+                styles = [(r, st) for r, st in todo if r.endswith(style_extract.STYLE_EXT + style_extract.MARKUP_EXT)]
+                for rel, stamp in styles:
+                    try:
+                        with open(os.path.join(a.root, rel), encoding="utf-8", errors="replace") as fh:
+                            src = fh.read()
+                    except OSError:
+                        continue
+                    old = a.extract.get(rel)
+                    a.extract[rel] = style_extract.extract(src, rel)
+                    a.stamp[rel] = stamp
+                    changed.append((a.id, rel, old, a.extract[rel]))
+                todo = [t for t in todo if t not in styles]
+                results = self._run_ts(a, [r for r, _ in todo]) if todo else []
                 for (rel, stamp), res in zip(todo, results):
                     old = a.extract.get(rel)
                     a.extract[rel] = res
@@ -284,6 +356,8 @@ class _Linker:
             if "/models/" in r or "/schemas/" in r or r.endswith("database.py") or "/db/" in r:
                 return "data"
             return "logic"
+        if r.endswith(style_extract.STYLE_EXT + style_extract.MARKUP_EXT):
+            return "style"
         if r.endswith((".tsx", ".jsx")) and ("/pages/" in r or "/screens/" in r or "/app/" in r or r.count("/") == 0):
             return "screen"
         if "/components/" in r or "/ui/" in r or r.endswith((".tsx", ".jsx")) and "/navigation/" not in r and "/context/" not in r:

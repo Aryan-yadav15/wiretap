@@ -14,6 +14,7 @@ const S = {
   g: null, I: null, r: { v: 'system' },
   sess: null, sessions: [], taskIdx: null, liveDot: false,
   trace: null, traceQ: '', summaries: {}, src: new Map(), sse: false,
+  moved: new Map(), sel: new Set(), ui: { side: true, panel: true, closed: [] },
 };
 
 // ======================= index =======================
@@ -131,7 +132,9 @@ function edgeWord(e) {
 
 // ======================= routing =======================
 
-function encodeRoute(r) { return '#' + new URLSearchParams(Object.entries(r).filter(([, v]) => v != null && v !== '')).toString(); }
+// every link carries the project (p), so a link opens the same project's map
+function encodeRoute(r) { return '#' + new URLSearchParams(Object.entries({ ...r, p: r.p ?? S.p }).filter(([, v]) => v != null && v !== '')).toString(); }
+const withP = url => S.p ? url + (url.includes('?') ? '&' : '?') + 'p=' + encodeURIComponent(S.p) : url;
 function parseRoute() {
   const p = new URLSearchParams(location.hash.slice(1));
   const r = Object.fromEntries(p.entries());
@@ -144,6 +147,9 @@ window.addEventListener('hashchange', async () => {
   const prev = S.r?.sid;
   S.r = parseRoute();
   if (S.r.v === 'live' && S.r.sid && S.r.sid !== prev) await loadSession(S.r.sid);
+  // a session belongs to one project: open that project's map
+  const want = (S.r.v === 'live' && S.r.sid && S.sess?.id === S.r.sid && S.sess.project) || S.r.p;
+  if (want && want !== S.p) { await loadGraph(want); if (S.r.v === 'live' && !S.r.sid) await loadSession(null); }
   render();
 });
 
@@ -175,7 +181,7 @@ function layout(ids, edges, opts = {}) {
     const arr = byLane.get(l), off = (maxRows - arr.length) * RH / 2;
     arr.forEach((id, i) => pos.set(id, { x: 16 + li * LW, y: TOP + off + i * RH }));
   });
-  return { pos, lanes: lanes.map((l, i) => ({ id: l, label: S.g.lanes.find(x => x.id === l).label, x: 16 + i * LW })), W: 16 + lanes.length * LW, H: TOP + maxRows * RH + 20 };
+  return { pos, lanes: lanes.map((l, i) => ({ id: l, label: S.g.lanes.find(x => x.id === l).label, x: 16 + i * LW, members: byLane.get(l) })), W: 16 + lanes.length * LW, H: TOP + maxRows * RH + 20 };
 }
 
 const MARKERS = ['line', 'accent', 'up', 'down', 'ghost', 'warn'];
@@ -190,28 +196,36 @@ function curve(A, B, w = NW, h = NH) {
   return { d, mx: (x1 + x2) / 2 + (Math.abs(B.x - A.x) < 2 ? 34 : 0), my: (y1 + y2) / 2 };
 }
 
-function pillLabel(x, y, t) {
+function pillLabel(x, y, t, attrs = '') {
   t = trunc(t, 34);
   const w = t.length * 5.7 + 12;
-  return `<g class="el" transform="translate(${x - w / 2},${y - 9})"><rect width="${w}" height="17" rx="8.5"/><text x="${w / 2}" y="12" text-anchor="middle">${esc(t)}</text></g>`;
+  return `<g class="el" data-w="${w}" ${attrs} transform="translate(${x - w / 2},${y - 9})"><rect width="${w}" height="17" rx="8.5"/><text x="${w / 2}" y="12" text-anchor="middle">${esc(t)}</text></g>`;
 }
 
 // edges: [{a, b, cls, label, hit:[a,b]}], nodes: [{id, cls, badge, badgeColor, title, sub}]
 function drawLanes(L, nodes, edges, opts = {}) {
+  // boxes the person dragged keep their place in this view
+  const vk = viewKey();
+  for (const [id, p] of L.pos) { const m = S.moved.get(vk + '|' + id); if (m) L.pos.set(id, { ...p, x: m.x, y: m.y }); }
+  GEO = { pos: L.pos, w: NW, h: NH, lanes: new Map() };
   let s = defs();
+  // a column can be dragged as a whole: its background moves with the boxes in it
   for (const l of L.lanes) {
-    s += `<rect class="lane-bg" x="${l.x - 8}" y="8" width="${NW + 16}" height="${L.H - 16}" rx="8"/><text class="lane-t" x="${l.x}" y="30">${esc(l.label)}</text>`;
+    const off = S.moved.get(vk + '|lane:' + l.id) || { x: 0, y: 0 };
+    GEO.lanes.set(l.id, { members: (l.members || []).filter(id => nodes.some(n => n.id === id)), off: { ...off } });
+    s += `<g class="lane" data-lane="${esc(l.id)}" transform="translate(${off.x},${off.y})"><title>Drag to move this column</title><rect class="lane-bg" x="${l.x - 8}" y="8" width="${NW + 16}" height="${L.H - 16}" rx="8"/><text class="lane-t" x="${l.x}" y="30">${esc(l.label)}</text></g>`;
   }
   const labels = [];
   for (const e of edges) {
     const A = L.pos.get(e.a), B = L.pos.get(e.b);
     if (!A || !B) continue;
     const c = curve(A, B);
-    if (e.hit) s += `<path class="hit" d="${c.d}" data-a="${esc(e.hit[0])}" data-b="${esc(e.hit[1])}"><title>See the calls behind this link</title></path>`;
-    s += `<path class="edge ${e.cls || ''}" d="${c.d}" marker-end="url(#ar-${markerFor(e.cls)})"/>`;
-    if (e.label) labels.push([c.mx, c.my, e.label]);
+    const ends = `data-ea="${esc(e.a)}" data-eb="${esc(e.b)}"`;
+    if (e.hit) s += `<path class="hit" ${ends} d="${c.d}" data-a="${esc(e.hit[0])}" data-b="${esc(e.hit[1])}"><title>See the calls behind this link</title></path>`;
+    s += `<path class="edge ${e.cls || ''}" ${ends} d="${c.d}" marker-end="url(#ar-${markerFor(e.cls)})"/>`;
+    if (e.label) labels.push([c.mx, c.my, e.label, ends]);
   }
-  if (labels.length <= (opts.maxLabels ?? 18)) for (const [x, y, t] of labels) s += pillLabel(x, y, t);
+  if (labels.length <= (opts.maxLabels ?? 18)) for (const [x, y, t, ends] of labels) s += pillLabel(x, y, t, ends);
   for (const n of nodes) {
     const p = L.pos.get(n.id); if (!p) continue;
     const title = n.title ?? labelOf(n.id), sub = n.sub ?? subOf(n.id);
@@ -227,23 +241,197 @@ function drawLanes(L, nodes, edges, opts = {}) {
   return s;
 }
 
-function mountSvg(svgStr, W, H) {
+// ======================= canvas: pan, zoom, drag boxes =======================
+// The drawing sits in one <g id="vp">; panning and zooming change only its transform, so nothing is redrawn.
+const VP = { k: 1, x: 12, y: 12, key: null };
+let GEO = null;  // boxes drawn by drawLanes ({pos, w, h}); only those can be dragged
+function viewKey() { const r = S.r || {}; return [S.p, r.v, r.id || r.sid || '', r.fn || '', r.d || ''].join('|'); }
+
+function mountSvg(svgStr) {
   const svg = $('svg');
-  svg.setAttribute('viewBox', `0 0 ${W} ${H}`);
-  svg.setAttribute('width', W); svg.setAttribute('height', H);
-  svg.innerHTML = svgStr;
+  svg.removeAttribute('viewBox');
+  svg.setAttribute('width', '100%'); svg.setAttribute('height', '100%');
+  svg.innerHTML = `<g id="vp">${svgStr}</g>`;
   svg.style.display = ''; $('empty').innerHTML = '';
+  $('scroll').classList.toggle('can-drag', !!GEO);
+  // a new view starts fitted; a live update of the same view keeps where you panned and zoomed
+  const key = viewKey();
+  if (VP.key !== key) { VP.key = key; S.sel.clear(); fitView(); } else applyVP();
+  cvTools();
 }
-function showEmpty(html) { const svg = $('svg'); svg.innerHTML = ''; svg.style.display = 'none'; $('empty').innerHTML = `<div class="empty">${html}</div>`; wireList($('empty')); }
+function applyVP() {
+  $('vp')?.setAttribute('transform', `translate(${VP.x},${VP.y}) scale(${VP.k})`);
+  if ($('zk')) $('zk').textContent = Math.round(VP.k * 100) + '%';
+}
+// all: fit the whole drawing (the Fit button). Otherwise fit the width only, so a tall view stays readable and scrolls.
+function fitView(all) {
+  const vp = $('vp'), box = $('scroll').getBoundingClientRect();
+  let b; try { b = vp.getBBox(); } catch { b = null; }
+  if (!b || !b.width || !box.width) { Object.assign(VP, { k: 1, x: 12, y: 12 }); return applyVP(); }
+  const k = all ? Math.max(0.2, Math.min(1, (box.width - 32) / b.width, (box.height - 32) / b.height)) : Math.max(0.55, Math.min(1, (box.width - 32) / b.width));
+  Object.assign(VP, { k, x: Math.max(16, (box.width - b.width * k) / 2) - b.x * k, y: 16 - b.y * k });
+  applyVP();
+}
+function zoomAt(f, cx, cy) {
+  const k = Math.max(0.2, Math.min(3, VP.k * f));
+  VP.x = cx - (cx - VP.x) * (k / VP.k); VP.y = cy - (cy - VP.y) * (k / VP.k); VP.k = k;
+  applyVP();
+}
+function cvTools() {
+  const moved = [...S.moved.keys()].some(k => k.startsWith(VP.key + '|'));
+  $('cvtools').innerHTML = `<button data-a="side" title="Show or hide the project list ( [ )" aria-pressed="${S.ui.side}">${icon('side')}</button>
+    <span class="grp"><button data-a="out" title="Zoom out">−</button><span id="zk">${Math.round(VP.k * 100)}%</span><button data-a="in" title="Zoom in">+</button></span>
+    <button data-a="fit" title="Fit to screen ( F )">Fit</button>
+    ${moved ? '<button data-a="reset" title="Put moved boxes back">Reset layout</button>' : ''}
+    <button data-a="focus" title="Hide both side panels">${S.ui.side || S.ui.panel ? 'Focus' : 'Exit focus'}</button>
+    <button data-a="panel" title="Show or hide the side panel ( ] )" aria-pressed="${S.ui.panel}">${icon('panel')}</button>`;
+}
+$('cvtools').addEventListener('click', e => {
+  const a = e.target.closest('button')?.dataset.a; if (!a) return;
+  const r = $('scroll').getBoundingClientRect();
+  if (a === 'in' || a === 'out') zoomAt(a === 'in' ? 1.2 : 1 / 1.2, r.width / 2, r.height / 2);
+  else if (a === 'fit') fitView(true);
+  else if (a === 'reset') { for (const k of [...S.moved.keys()]) if (k.startsWith(VP.key + '|')) S.moved.delete(k); render(); }
+  else if (a === 'side' || a === 'panel') setUI({ [a]: !S.ui[a] });
+  else if (a === 'focus') { const on = S.ui.side || S.ui.panel; setUI({ side: !on, panel: !on }); }
+});
+(function canvasPointer() {
+  const sc = $('scroll');
+  let drag = null;
+  sc.addEventListener('wheel', e => {
+    if (!$('vp')) return;
+    e.preventDefault();
+    const r = sc.getBoundingClientRect();
+    if (e.ctrlKey || e.metaKey) zoomAt(Math.exp(-e.deltaY * 0.01), e.clientX - r.left, e.clientY - r.top);  // pinch or ⌘ + scroll
+    else { VP.x -= e.deltaX; VP.y -= e.deltaY; applyVP(); }
+  }, { passive: false });
+  sc.addEventListener('pointerdown', e => {
+    if (e.button !== 0 || !$('vp') || e.target.closest('#cvtools')) return;
+    const node = e.target.closest('.node');
+    const id = node?.dataset.id;
+    let ids = GEO && id && GEO.pos.has(id) ? (S.sel.has(id) ? [...S.sel].filter(x => GEO.pos.has(x)) : [id]) : null;
+    const lane = !node && GEO && e.target.closest('.lane')?.dataset.lane;
+    if (lane && !e.shiftKey) ids = GEO.lanes.get(lane).members;
+    // shift + drag on empty space draws a box; everything it touches gets picked
+    const box = !node && GEO && e.shiftKey ? toContent(e) : null;
+    drag = { x: e.clientX, y: e.clientY, moved: false, ids, lane: ids && lane, box };
+  });
+  window.addEventListener('pointermove', e => {
+    if (!drag) return;
+    const dx = e.clientX - drag.x, dy = e.clientY - drag.y;
+    if (!drag.moved && Math.hypot(dx, dy) < 4) return;
+    if (!drag.moved && drag.ids) for (const id of drag.ids) { const el = $('svg').querySelector(`.node[data-id="${CSS.escape(id)}"]`); el?.parentNode.appendChild(el); }  // dragged boxes on top
+    drag.moved = true; drag.x = e.clientX; drag.y = e.clientY;
+    sc.classList.add('dragging');
+    if (drag.box) { drawMarquee(drag.box, toContent(e)); return; }
+    if (!drag.ids) { VP.x += dx; VP.y += dy; applyVP(); return; }
+    moveBoxes(drag.ids, dx / VP.k, dy / VP.k);
+    if (drag.lane) moveLane(drag.lane, dx / VP.k, dy / VP.k);
+  });
+  window.addEventListener('pointerup', e => {
+    if (!drag) return;
+    if (drag.box) { pickInBox(drag.box, toContent(e)); $('marquee')?.remove(); }
+    if (drag.moved) { S.justDragged = true; setTimeout(() => S.justDragged = false, 0); if (drag.ids) cvTools(); }
+    else if (!drag.ids && !drag.box && !S.justDragged && S.sel.size) { S.sel.clear(); $('svg').querySelectorAll('.node.picked').forEach(n => n.classList.remove('picked')); }
+    sc.classList.remove('dragging');
+    drag = null;
+  });
+})();
+// ---------- layout: collapsible and resizable panels, foldable sections (kept per browser) ----------
+try { Object.assign(S.ui, JSON.parse(localStorage.getItem('wiretap-ui') || '{}')); } catch { /* storage off */ }
+function setUI(patch) {
+  Object.assign(S.ui, patch);
+  try { localStorage.setItem('wiretap-ui', JSON.stringify(S.ui)); } catch { /* storage off */ }
+  applyUI();
+}
+function applyUI() {
+  const sh = document.querySelector('.shell');
+  sh.classList.toggle('no-side', !S.ui.side); sh.classList.toggle('no-panel', !S.ui.panel);
+  if (S.ui.sw) sh.style.setProperty('--side-w', S.ui.sw + 'px');
+  if (S.ui.pw) sh.style.setProperty('--panel-w', S.ui.pw + 'px');
+  if (S.ui.ch) $('scroll').style.height = S.ui.ch + 'px';
+  if ($('vp')) cvTools();
+  if (S.g) renderSide();
+}
+applyUI();
+document.querySelectorAll('[data-r]').forEach(h => h.addEventListener('pointerdown', e => {
+  e.preventDefault();
+  const kind = h.dataset.r, x0 = e.clientX, y0 = e.clientY;
+  const start = kind === 'sw' ? $('side').offsetWidth : kind === 'pw' ? $('panel').offsetWidth : $('scroll').offsetHeight;
+  const [lo, hi] = kind === 'ch' ? [240, 2400] : [180, 640];
+  document.body.classList.add('resizing');
+  const mv = ev => {
+    const d = kind === 'pw' ? x0 - ev.clientX : kind === 'sw' ? ev.clientX - x0 : ev.clientY - y0;
+    S.ui[kind] = Math.round(Math.max(lo, Math.min(hi, start + d))); applyUI();
+  };
+  const up = () => { removeEventListener('pointermove', mv); removeEventListener('pointerup', up); document.body.classList.remove('resizing'); setUI({}); };
+  addEventListener('pointermove', mv); addEventListener('pointerup', up);
+}));
+// every panel section with a heading folds; the step bar too
+function foldable() {
+  const closed = new Set(S.ui.closed || []);
+  const wire = (box, head, key) => {
+    box.classList.add('fold'); box.classList.toggle('shut', closed.has(key));
+    head.tabIndex = 0; head.setAttribute('role', 'button'); head.setAttribute('aria-expanded', !closed.has(key));
+    const flip = () => { closed.has(key) ? closed.delete(key) : closed.add(key); setUI({ closed: [...closed] }); box.classList.toggle('shut', closed.has(key)); head.setAttribute('aria-expanded', !closed.has(key)); };
+    head.onclick = flip; head.onkeydown = e => { if (e.key === 'Enter') flip(); };
+  };
+  $('panel').querySelectorAll(':scope > div > h3:first-child').forEach(h => wire(h.parentNode, h, h.textContent.trim()));
+  const sh = $('stepper').querySelector('.stepper-h'); if (sh) wire($('stepper'), sh, 'steps');
+}
+function toContent(e) {
+  const r = $('scroll').getBoundingClientRect();
+  return { x: (e.clientX - r.left - VP.x) / VP.k, y: (e.clientY - r.top - VP.y) / VP.k };
+}
+function drawMarquee(a, b) {
+  let m = $('marquee');
+  if (!m) { m = document.createElementNS('http://www.w3.org/2000/svg', 'rect'); m.id = 'marquee'; $('vp').appendChild(m); }
+  m.setAttribute('x', Math.min(a.x, b.x)); m.setAttribute('y', Math.min(a.y, b.y));
+  m.setAttribute('width', Math.abs(b.x - a.x)); m.setAttribute('height', Math.abs(b.y - a.y));
+}
+function pickInBox(a, b) {
+  const x1 = Math.min(a.x, b.x), x2 = Math.max(a.x, b.x), y1 = Math.min(a.y, b.y), y2 = Math.max(a.y, b.y);
+  for (const [id, p] of GEO.pos) {
+    if (p.x > x2 || p.x + GEO.w < x1 || p.y > y2 || p.y + GEO.h < y1) continue;
+    S.sel.add(id);
+    $('svg').querySelector(`.node[data-id="${CSS.escape(id)}"]`)?.classList.add('picked');
+  }
+}
+function moveLane(lane, dx, dy) {
+  const L = GEO.lanes.get(lane); L.off.x += dx; L.off.y += dy;
+  S.moved.set(viewKey() + '|lane:' + lane, { ...L.off });
+  $('svg').querySelector(`.lane[data-lane="${CSS.escape(lane)}"]`)?.setAttribute('transform', `translate(${L.off.x},${L.off.y})`);
+}
+function moveBoxes(ids, dx, dy) {
+  const set = new Set(ids), vk = viewKey(), svg = $('svg');
+  for (const id of ids) {
+    const p = GEO.pos.get(id); p.x += dx; p.y += dy;
+    S.moved.set(vk + '|' + id, { x: p.x, y: p.y });
+    svg.querySelector(`.node[data-id="${CSS.escape(id)}"]`)?.setAttribute('transform', `translate(${p.x},${p.y})`);
+  }
+  svg.querySelectorAll('[data-ea]').forEach(el => {
+    const a = el.dataset.ea, b = el.dataset.eb;
+    if (!set.has(a) && !set.has(b)) return;
+    const c = curve(GEO.pos.get(a), GEO.pos.get(b), GEO.w, GEO.h);
+    if (el.tagName === 'path') el.setAttribute('d', c.d);
+    else el.setAttribute('transform', `translate(${c.mx - el.dataset.w / 2},${c.my - 9})`);
+  });
+}
+function showEmpty(html) { const svg = $('svg'); svg.innerHTML = ''; svg.style.display = 'none'; $('empty').innerHTML = `<div class="empty">${html}</div>`; wireList($('empty')); VP.key = null; cvTools(); }
 
 function wireNodes(onClick, onDbl) {
   $('svg').querySelectorAll('.node').forEach(el => {
-    el.addEventListener('click', () => onClick(el.dataset.id));
+    el.addEventListener('click', ev => {
+      if (S.justDragged) return;
+      if (ev.shiftKey) { const id = el.dataset.id; S.sel.has(id) ? S.sel.delete(id) : S.sel.add(id); el.classList.toggle('picked', S.sel.has(id)); return; }
+      onClick(el.dataset.id);
+    });
+    if (S.sel.has(el.dataset.id)) el.classList.add('picked');
     if (onDbl) el.addEventListener('dblclick', () => onDbl(el.dataset.id));
     el.addEventListener('keydown', ev => { if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); onClick(el.dataset.id); } });
   });
   $('svg').querySelectorAll('.hit').forEach(el => {
-    el.addEventListener('click', () => go({ v: 'link', a: el.dataset.a, b: el.dataset.b }));
+    el.addEventListener('click', () => { if (!S.justDragged) go({ v: 'link', a: el.dataset.a, b: el.dataset.b }); });
     el.addEventListener('mouseenter', () => el.nextElementSibling?.classList.add('hov'));
     el.addEventListener('mouseleave', () => el.nextElementSibling?.classList.remove('hov'));
   });
@@ -251,9 +439,25 @@ function wireNodes(onClick, onDbl) {
 
 function legend(items) { $('legend').innerHTML = items.map(([c, t]) => c ? `<span><i style="background:${c}"></i>${t}</span>` : `<span>${t}</span>`).join(''); }
 function crumbs(parts) {
-  $('crumbs').innerHTML = parts.map((p, i) => i === parts.length - 1 ? `<span class="cur">${esc(p[0])}</span>` : `<button data-i="${i}">${esc(p[0])}</button><span class="sep">›</span>`).join('');
+  $('title').textContent = parts[parts.length - 1][0];
+  $('title').title = parts[parts.length - 1][0];
+  $('crumbs').hidden = parts.length < 2;
+  // the last part is the big title, so the path line shows only the parts above it
+  $('crumbs').innerHTML = parts.slice(0, -1).map((p, i) => `<button data-i="${i}">${esc(p[0])}</button><span class="sep">/</span>`).join('');
   $('crumbs').querySelectorAll('button').forEach(b => b.addEventListener('click', () => go(parts[+b.dataset.i][1])));
 }
+const ICON = {
+  file: '<path d="M4 1.5h5.5L13 5v9.5H4z"/><path d="M9.5 1.5V5H13"/>',
+  fn: '<path d="M6 2.5C4.5 2.5 4.5 4 4.5 5.5S3.5 8 2.5 8c1 0 2 .5 2 2.5s0 3 1.5 3M10 2.5c1.5 0 1.5 1.5 1.5 3s1 2.5 2 2.5c-1 0-2 .5-2 2.5s0 3-1.5 3"/>',
+  link: '<path d="M6.5 9.5l3-3M7 4.5l1.5-1.5a2.5 2.5 0 0 1 3.5 3.5L10.5 8M9 11.5L7.5 13a2.5 2.5 0 0 1-3.5-3.5L5.5 8"/>',
+  steps: '<path d="M2 4h12M2 8h12M2 12h8"/>',
+  clock: '<circle cx="8" cy="8" r="6"/><path d="M8 4.5V8l2.5 1.5"/>',
+  dot: '<circle cx="8" cy="8" r="3"/>',
+  side: '<rect x="1.5" y="2.5" width="13" height="11" rx="1.5"/><path d="M6 2.5v11"/>',
+  panel: '<rect x="1.5" y="2.5" width="13" height="11" rx="1.5"/><path d="M10 2.5v11"/>',
+};
+const icon = (k, cls = '') => `<svg viewBox="0 0 16 16" class="${cls}" aria-hidden="true">${ICON[k] || ''}</svg>`;
+function chips(list) { $('chips').innerHTML = list.filter(Boolean).map(([c, k, t]) => `<span class="chip ${c}">${icon(k)}${esc(t)}</span>`).join(''); }
 function tools(html) { const t = $('tools'); t.hidden = !html; t.innerHTML = html || ''; }
 const item = (pill, title, sub, file, attrs = '') => `<li ${attrs}><span class="pill ${pill[0]}">${esc(pill[1])}</span><span><span class="m">${title}</span>${sub ? `<span class="r">${sub}</span>` : ''}${file ? `<span class="f">${esc(file)}</span>` : ''}</span></li>`;
 function wireList(root) {
@@ -287,19 +491,73 @@ function changedFnSet(task) {
 function render() {
   if (!S.g) return;
   document.querySelectorAll('#views button').forEach(b => b.setAttribute('aria-pressed', b.dataset.v === (['file', 'link'].includes(S.r.v) ? 'map' : S.r.v)));
-  $('live-tab').innerHTML = 'Live' + (S.liveDot && S.r.v !== 'live' ? '<span class="dot"></span>' : '');
+  $('live-tab').querySelector('.dot')?.remove();
+  if (S.liveDot && S.r.v !== 'live') $('live-tab').insertAdjacentHTML('beforeend', '<span class="dot"></span>');
   if (S.r.v === 'live') S.liveDot = false;
-  tools('');
+  tools(''); chips([]); $('stepper').hidden = true; S.stepNav = null; GEO = null;
+  renderSide();
   const v = { system: viewSystem, map: viewMap, file: viewFile, link: viewLink, live: viewLive, trace: viewTrace, resources: viewResources }[S.r.v] || viewSystem;
-  try { v(); } catch (err) {
+  try { v(); foldable(); } catch (err) {
     console.error(err);
     $('panel').innerHTML = `<div class="callout"><b>This view hit a bug</b>${esc(err.message)}</div>`;
   }
 }
 
+// ---------- sidebar: apps and their most connected files ----------
+function renderSide() {
+  const I = S.I, g = S.g;
+  const cur = S.r.id ? (S.r.v === 'file' ? S.r.id : ownerOf(I, S.r.id)) : null;
+  const curApp = cur && I.files.has(cur) ? I.files.get(cur).app : null;
+  if (!S.openApps) S.openApps = new Set([curApp || g.apps[0]?.id]);
+  if (curApp && S.sideFor !== cur) S.openApps.add(curApp);
+  const key = [cur, [...S.openApps].join(), g.project, g.version, g.stats.files, (S.projects || []).length, S.ui.side].join('|');
+  if (S.sideKey === key) return;
+  S.sideKey = key; S.sideFor = cur;
+  if (!I.topByApp) {
+    I.topByApp = new Map();
+    for (const f of g.files) { let a = I.topByApp.get(f.app); if (!a) I.topByApp.set(f.app, a = []); a.push(f); }
+    for (const a of I.topByApp.values()) a.sort((x, y) => I.degree(y.id) - I.degree(x.id) || x.label.localeCompare(y.label));
+  }
+  const st = g.stats, m = st.http_matched || 0, um = st.http_unmatched || 0;
+  const folder = c => `<svg class="fold" viewBox="0 0 18 15"><path d="M1 3a1.5 1.5 0 0 1 1.5-1.5h4l1.6 1.8h7.4A1.5 1.5 0 0 1 17 4.8v7.7a1.5 1.5 0 0 1-1.5 1.5h-13A1.5 1.5 0 0 1 1 12.5z" style="fill:${c};stroke:var(--rule);stroke-width:1.2"/></svg>`;
+  // collapsed: a slim rail with the open button and one folder per app (a click opens the list at that app)
+  $('side').classList.toggle('rail', !S.ui.side);
+  if (!S.ui.side) {
+    $('side').innerHTML = `<button class="side-btn" id="sidecol" title="Show the project list ( [ )" aria-label="Show the project list">»</button>
+      ${g.apps.map(a => `<button class="rail-app" data-app="${esc(a.id)}" title="${esc(a.name)}">${folder(`var(--app${I.appIdx.get(a.id)})`)}</button>`).join('')}`;
+    $('sidecol').onclick = () => setUI({ side: true });
+    $('side').querySelectorAll('.rail-app').forEach(b => b.onclick = () => { S.openApps = new Set([b.dataset.app]); setUI({ side: true }); });
+    return;
+  }
+  $('side').innerHTML = `<div class="tree">
+    <div class="side-h"><span>Project</span><button class="side-btn" id="sidecol" title="Collapse ( [ )" aria-label="Collapse the project list">«</button></div>
+    ${(S.projects || []).length > 1 ? `<label class="proj-pick"><span hidden>Project</span><select id="proj" aria-label="Project">${S.projects.map(p => `<option value="${esc(p.id)}" ${p.id === S.p ? 'selected' : ''}>${esc(p.name)}${p.auto ? ' (auto)' : ''}</option>`).join('')}</select></label>` : ''}
+    <div class="tree-h"><span><svg viewBox="0 0 18 15"><path d="M1 3a1.5 1.5 0 0 1 1.5-1.5h4l1.6 1.8h7.4A1.5 1.5 0 0 1 17 4.8v7.7a1.5 1.5 0 0 1-1.5 1.5h-13A1.5 1.5 0 0 1 1 12.5z"/></svg>${esc(g.name)}</span><small>${plural(st.files, 'file')}</small></div>
+    ${g.apps.map(a => {
+      const open = S.openApps.has(a.id), files = I.topByApp.get(a.id) || [];
+      return `<button class="app-row" data-app="${esc(a.id)}" aria-expanded="${open}"><svg class="chev" viewBox="0 0 12 12"><path d="M4.5 2.5L8 6l-3.5 3.5"/></svg>${folder(`var(--app${I.appIdx.get(a.id)})`)}<span class="nm">${esc(a.name)}</span><small>${files.length}</small></button>
+        ${open ? `<ul class="app-files">${files.slice(0, 8).map(f => `<li><button data-id="${esc(f.id)}" class="${f.id === cur ? 'on' : ''}" title="${esc(f.rel)}">${icon('file')}<span>${esc(f.label)}</span></button></li>`).join('')}${files.length > 8 ? `<li class="more-f">+${files.length - 8} more · press /</li>` : ''}</ul>` : ''}`;
+    }).join('')}</div>
+    <div class="card progress"><div class="kv"><b>API calls matched</b><span>${m} / ${m + um}</span></div>
+      <div class="bar" title="API calls in the apps that were matched to a backend route"><i style="width:${m + um ? Math.round(100 * m / (m + um)) : 100}%"></i></div>
+      <div class="kv"><span>functions</span><span>${st.functions}</span></div><div class="kv"><span>links</span><span>${st.edges}</span></div>
+      <div class="kv"><span>calls not followed</span><span>${st.unresolved_calls || 0}</span></div></div>`;
+  $('sidecol').onclick = () => setUI({ side: false });
+  if ($('proj')) $('proj').onchange = e => go({ v: 'system', p: e.target.value });
+  $('side').querySelectorAll('.app-row').forEach(b => b.onclick = () => { const a = b.dataset.app; S.openApps.has(a) ? S.openApps.delete(a) : S.openApps.add(a); renderSide(); });
+  $('side').querySelectorAll('.app-files button').forEach(b => b.onclick = () => go({ v: 'file', id: b.dataset.id }));
+}
+
 // ---------- System ----------
 function viewSystem() {
   const I = S.I, g = S.g;
+  if (!g.apps.length) {
+    crumbs([[g.name]]);
+    $('readout').innerHTML = ''; legend([]);
+    showEmpty(`<h2>Nothing to map here</h2><p>${esc(g.note || 'No apps found.')}</p><p class="path">${esc(g.root || '')}</p><p>Claude's steps still show under Live.</p>`);
+    $('panel').innerHTML = `<div><h2>${esc(g.name)}</h2><p>${esc(g.note || '')}</p></div>`;
+    return;
+  }
   const cols = { client: 0, backend: 1, data: 2, outside: 3 };
   const X = [16, 330, 644, 958];
   const nodes = [];
@@ -359,6 +617,7 @@ function viewSystem() {
   mountSvg(s, W, H);
   wireNodes(id => go({ v: 'system', id: S.r.id === id ? undefined : id }), id => go({ v: 'map', id }));
   crumbs([['System']]);
+  chips([['green', 'file', plural(g.stats.files, 'file')], ['amber', 'fn', plural(g.stats.functions, 'function')], ['lilac', 'link', plural(g.stats.edges, 'link')]]);
   const st = g.stats;
   const httpN = g.edges.filter(e => e.k === 'http').length, missing = g.nodes.filter(n => n.kind === 'route' && n.missing).length;
   $('readout').innerHTML = `<b>${esc(g.name)}</b>: ${plural(g.apps.length, 'app')}, ${st.files} files, ${st.functions} functions.
@@ -476,6 +735,7 @@ function viewMap() {
   const dDown = [...(I.fout.get(id) || new Map()).entries()].sort((a, b) => b[1].n - a[1].n);
   const upApps = [...new Set([...up.dist.keys()].map(appOf).filter(Boolean).map(appName))];
   crumbs([['System', { v: 'system' }], [labelOf(id)]]);
+  chips([appOf(id) && ['green', 'dot', appName(appOf(id))], ['amber', 'link', `${dUp.length} in`], ['teal', 'link', `${dDown.length} out`]]);
   const kind = kindOf(id);
   $('readout').innerHTML = `<b>${esc(labelOf(id))}</b> is used by <span class="k-up">${plural(dUp.length, 'file')}</span>${upApps.length ? ` across ${esc(list(upApps))}` : ''} and directly reaches <span class="k-down">${dDown.length}</span>.
     <small>${dUp.length ? `If you change it, recheck: ${esc(list(dUp.slice(0, 5).map(([n]) => labelOf(n))))}${dUp.length > 5 ? ` and ${dUp.length - 5} more` : ''}.` : 'Nothing calls into it from another file.'}${up.more.size || down.more.size ? ' Some boxes were left out to keep the map readable; the side panel lists everything.' : ''}</small>`;
@@ -634,6 +894,7 @@ function viewFile() {
   });
 
   crumbs([['System', { v: 'system' }], [f.label, { v: 'map', id: fileId }], ...(sel ? [[labelOf(sel)]] : [['Inside']])]);
+  chips([['green', 'dot', appName(f.app)], ['amber', 'fn', plural(fns.length, 'function')]]);
   legend([['var(--accent)', 'Selected function / call'], ['var(--down)', 'Where a flow starts'], [null, 'Click a function to trace it; click a box on either side to step into that file']]);
   const P = $('panel');
   if (!sel) {
@@ -671,7 +932,7 @@ async function loadSource(fileId, start, end) {
   const key = `${fileId}:${start}:${end}:${S.g.version}`;
   let data = S.src.get(key);
   if (!data) {
-    try { data = await (await fetch(`/api/source?file=${encodeURIComponent(fileId)}&start=${start}&end=${end}`)).json(); S.src.set(key, data); }
+    try { data = await (await fetch(withP(`/api/source?file=${encodeURIComponent(fileId)}&start=${start}&end=${end}`))).json(); S.src.set(key, data); }
     catch { data = { lines: ['(could not load source)'], start }; }
   }
   const el = $('src'); if (!el) return;
@@ -705,20 +966,24 @@ function viewLink() {
 }
 
 // ---------- Live ----------
-function liveClasses() {
-  const out = { cls: new Map(), badge: new Map(), badgeColor: new Map() };
+// evs: the events up to the step being shown (all of them when live).
+// byOrder: number edited files in the order Claude first edited them, instead of counting changed functions.
+function liveClasses(evs, byOrder) {
+  const out = { cls: new Map(), badge: new Map(), badgeColor: new Map(), order: [] };
   const t = curTask(); if (!t) return out;
-  const ripple = new Set(t.ripple_files || []);
-  for (const f of ripple) out.cls.set(f, 'up');
-  for (const f of t.planned || []) if (!t.touched[f]) out.cls.set(f, 'ghost');
+  evs = evs || t.events;
+  for (const e of evs) if (['edit', 'create'].includes(e.k) && e.file && !out.order.includes(e.file)) out.order.push(e.file);
+  if (out.order.length) for (const f of t.ripple_files || []) out.cls.set(f, 'up');
+  for (const f of t.planned || []) if (!out.order.includes(f)) out.cls.set(f, 'ghost');
   for (const [f, rec] of Object.entries(t.touched)) {
+    if (!out.order.includes(f)) continue;  // not edited yet at this step
     const off = (t.summary.off_plan || []).includes(f);
     out.cls.set(f, rec.status === 'created' ? 'new' : off ? 'warn' : 'edit');
     const n = Object.keys(rec.fns).length;
-    out.badge.set(f, off ? '!' : n ? String(n) : null);
+    out.badge.set(f, off ? '!' : byOrder ? String(out.order.indexOf(f) + 1) : n ? String(n) : null);
     out.badgeColor.set(f, off ? 'var(--warn)' : rec.status === 'created' ? 'var(--down)' : 'var(--accent)');
   }
-  const last = [...t.events].reverse().find(e => e.file);
+  const last = [...evs].reverse().find(e => e.file);
   if (last) out.cls.set(last.file, (out.cls.get(last.file) || 'read') + ' cur');
   return out;
 }
@@ -990,20 +1255,108 @@ function drawStrands(list, L, isFocus, shown, loose = []) {
 
 function toggleReplay(t) {
   clearInterval(S.replayTimer);
-  if (S.replay) { S.replay = null; render(); return; }
-  S.replay = { key: S.sess.id + ':' + S.sess.tasks.indexOf(t), upto: 1 };
+  if (S.replay) { const at = S.replay.upto; S.replay = null; stepTo(t, at); return; }
+  const from = S.r.step && +S.r.step < t.events.length ? +S.r.step : 1;
+  S.replay = { key: S.sess.id + ':' + S.sess.tasks.indexOf(t), upto: from };
   S.replayTimer = setInterval(() => {
     if (!S.replay || S.r.v !== 'live') { clearInterval(S.replayTimer); S.replay = null; return; }
-    if (++S.replay.upto > t.events.length) { clearInterval(S.replayTimer); S.replay = null; }
+    if (++S.replay.upto >= t.events.length) { clearInterval(S.replayTimer); S.replay = null; stepTo(t, t.events.length); return; }
     render();
   }, 650);
   render();
+}
+// the last step is the live view itself, so it drops &step from the link
+function stepTo(t, n) {
+  clearInterval(S.replayTimer); S.replay = null;
+  n = Math.max(1, Math.min(t.events.length, n));
+  const r = { ...S.r, v: 'live' }; delete r.step;
+  go(n >= t.events.length ? r : { ...r, step: n });
+}
+const STEP_WORD = { prompt: 'Your request', read: 'Read', search: 'Search', run: 'Shell', plan: 'Plan', create: 'Create', edit: 'Edit', delete: 'Delete', test: 'Tests', stop: 'Done' };
+const STEP_HINT = {
+  prompt: 'Your request. Everything after this is Claude working on it.',
+  read: 'Claude opened a file. Functions on the lines it read are numbered on the map in the order it looked.',
+  search: 'A search (Grep, or grep / rg in the shell). Files it matched are drawn with a dashed outline.',
+  run: 'A shell command that was not a read or a search, such as a build or git.',
+  plan: 'Claude wrote a plan. Planned files that are not touched yet show in purple.',
+  create: 'A new file. It shows in teal, linked to the files it connects to.',
+  edit: 'A change. The number on the box is how many functions changed; files that call them turn amber.',
+  delete: 'A file was removed.',
+  test: 'Tests ran. The result is counted further down this panel.',
+  stop: 'Claude finished this request. Step back through it with ← or press Replay.',
+  shot: 'Claude took screenshots of the app and is looking at them to see whether the change looks right. Screenshots are not on the map.',
+};
+const hintFor = e => isShot(e) || (e.k === 'run' && /screenshots/.test(shellWhat(e.text))) ? STEP_HINT.shot : STEP_HINT[e.k] || '';
+const isShot = e => e.k === 'read' && !e.file && /\.(png|jpe?g|webp|gif)$/i.test(e.path || '');
+// what a shell command is for, in a few words (env assignments like S=/tmp/x && are skipped)
+function shellWhat(cmd) {
+  const c = String(cmd || '').replace(/^\s*(\w+=\S+\s*(&&|;)?\s*)+/, '');
+  if (/playwright|puppeteer|screenshot|\bshot\w*\.mjs|\bseq\w*\.mjs|\bsips\b/.test(cmd)) return 'Took screenshots';
+  if (/\b(curl|wget)\b/.test(c)) return 'Downloaded a file';
+  if (/\b(npm|pnpm|yarn) (run )?build\b|\bvite build\b|\bnext build\b|\btsc\b/.test(c)) return 'Built the app';
+  if (/\b(npm|pnpm|yarn) (i|install|add)\b/.test(c)) return 'Installed packages';
+  if (/\b(npm|pnpm|yarn) (run )?(dev|start)\b/.test(c)) return 'Started the app';
+  if (/\b(magick|convert|ffmpeg)\b/.test(c)) return 'Processed an image';
+  if (/^\s*git\b/.test(c)) return 'Checked git';
+  if (/^\s*(ls|find|tree|wc)\b/.test(c)) return 'Listed files';
+  return 'Ran ' + (c.trim().split(/\s+/)[0] || 'a command');
+}
+// the readable words in a search pattern: `Deloitte | 0\.4[0-2]\b` -> Deloitte
+function searchWords(p) {
+  const w = String(p || '').split(/\s*\|\s*/).map(x => x.replace(/\\[bBdDsSwW]|\[[^\]]*\]|[\\^$(){}*+?.<>=]/g, ' ').trim().split(/\s+/).filter(t => /[A-Za-z]{3}/.test(t)).join(' ')).filter(Boolean);
+  return w.length ? [...new Set(w)].slice(0, 3).join(', ') : 'a code pattern';
+}
+const fileName = e => e.file ? labelOf(e.file) : (e.path || '').split('/').pop();
+// [headline, short label for the step bar]
+function describeStep(e) {
+  const f = fileName(e);
+  if (isShot(e)) return ['Looked at a screenshot · ' + f, 'Screenshot'];
+  return {
+    prompt: ['Your request', 'Your request'],
+    read: ['Read ' + f, 'Read ' + f],
+    search: [e.pattern ? 'Searched for ' + searchWords(e.pattern) : 'Searched the code', 'Search ' + (e.pattern ? searchWords(e.pattern) : '')],
+    run: [shellWhat(e.text), shellWhat(e.text)],
+    plan: ['Made a plan', 'Plan'],
+    create: ['Created ' + f, 'New ' + f],
+    edit: [(e.via === 'editor' ? 'You edited ' : 'Edited ') + f, 'Edit ' + f],
+    delete: ['Deleted ' + f, 'Delete ' + f],
+    test: ['Ran the tests', 'Tests'],
+    stop: ['Claude finished', 'Done'],
+  }[e.k] || [e.k, e.k];
+}
+const stepLabel = e => describeStep(e)[1];
+// group the timeline into phases: looking around, editing, checking, … (rules only, no model calls)
+function phasesOf(events) {
+  const edited = new Set(), out = [];
+  events.forEach((e, i) => {
+    let k;
+    if (e.k === 'prompt') k = 'ask';
+    else if (e.k === 'stop') k = 'done';
+    else if (e.k === 'plan') k = 'plan';
+    else if (['edit', 'create', 'delete'].includes(e.k)) { k = 'change'; if (e.file) edited.add(e.file); }
+    else if (e.k === 'test' || isShot(e)) k = 'check';
+    else if (e.k === 'run') k = edited.size || /screenshots|Built|Started/.test(shellWhat(e.text)) ? 'check' : 'explore';
+    else if (e.file && edited.has(e.file)) k = 'change';  // rereading a file it is editing
+    else k = 'explore';
+    const last = out[out.length - 1];
+    if (last && last.k === k) { last.to = i; last.ev.push(e); } else out.push({ k, from: i, to: i, ev: [e] });
+  });
+  for (const ph of out) {
+    const files = [...new Set(ph.ev.filter(e => ['edit', 'create', 'delete'].includes(e.k)).map(fileName))];
+    ph.label = {
+      ask: 'Your request', done: 'Done', plan: 'Planning', explore: 'Looking around',
+      change: 'Editing ' + (files.slice(0, 2).join(', ') + (files.length > 2 ? ` +${files.length - 2}` : '') || 'files'),
+      check: ph.ev.some(isShot) || ph.ev.some(e => e.k === 'run' && /screenshots/.test(shellWhat(e.text))) ? 'Checking screenshots'
+        : ph.ev.some(e => e.k === 'test') ? 'Running tests' : ph.ev.some(e => e.k === 'run' && /Built/.test(shellWhat(e.text))) ? 'Building' : 'Checking',
+    }[ph.k];
+  }
+  return out;
 }
 
 function viewLive() {
   const I = S.I;
   crumbs([['Live session']]);
-  legend([['var(--accent)', 'Edited (number = functions changed)'], ['var(--down)', 'Created'], ['var(--up)', 'Calls changed code'], ['var(--ghost)', 'In the plan, not touched yet'], ['var(--warn)', '! Edited outside the plan'], [null, 'Dashed = read or searched by Claude']]);
+  legend([['var(--accent)', 'Edited · ① ② = the order Claude edited them'], ['var(--down)', 'Created'], ['var(--up)', 'Not edited, but uses changed code: recheck it'], ['var(--ghost)', 'In the plan, not touched yet'], ['var(--warn)', '! Edited outside the plan'], [null, 'Pulsing = the file in this step · dashed = only read']]);
   const t = curTask();
   if (!S.sess || !t) {
     if (S.r.sid) {
@@ -1032,16 +1385,16 @@ function viewLive() {
   const reads = [...t.events].reverse().flatMap(e => e.k === 'read' && e.file ? [e.file] : e.k === 'search' ? (e.files || []).slice(0, 3) : []).filter(f => I.files.has(f));
   [...new Set(reads)].slice(0, 8).forEach(f => ids.add(f));
   (t.planned_new || []).slice(0, 8).forEach(p => { if (!touched.some(f => f.endsWith(p))) ids.add('new:' + p); });
-  const live = liveClasses();
+  // replaying (or a link with &step=N): show the task as it was after that many timeline steps
+  const rp = S.replay && S.replay.key === S.sess.id + ':' + S.sess.tasks.indexOf(t) ? S.replay : (S.r.step ? { upto: +S.r.step } : null);
+  const evs = rp ? t.events.slice(0, rp.upto) : t.events;
+  const live = liveClasses(evs, true);
   const edges = [];
   for (const a of ids) for (const [b, r] of (I.fout.get(a) || new Map())) if (ids.has(b)) {
     const hot = x => t.touched[x] || ripple.includes(x);
     const cls = t.touched[a]?.status === 'created' ? 'new' : (hot(a) && hot(b)) ? 'up' : 'faint';
     edges.push({ a, b, cls, hit: [a, b] });
   }
-  // replaying (or a link with &step=N): show the task as it was after that many timeline steps
-  const rp = S.replay && S.replay.key === S.sess.id + ':' + S.sess.tasks.indexOf(t) ? S.replay : (S.r.step ? { upto: +S.r.step } : null);
-  const evs = rp ? t.events.slice(0, rp.upto) : t.events;
   const isQuestion = !touched.length && !(t.planned || []).length;
   const looked = isQuestion ? lookedFrom(evs, rp ? null : t.looked) : null;
   const answer = looked && looked.score.size ? buildStrands(looked) : null;
@@ -1058,23 +1411,35 @@ function viewLive() {
       const i = +h.parentNode.dataset.strand; S.strandOnly = S.strandOnly === i ? null : i; render();
     });
     legend([['var(--accent)', '① ② = order Claude looked'], [null, 'Solid = read · dashed = a search matched it · green = where the flow starts. Click a row title to show only that flow.']]);
-    tools(`<button class="btn" id="replay">${rp ? '■ Stop' : '▶ Replay'}</button><span>${rp ? `Step ${rp.upto} of ${t.events.length}` : 'Step through what Claude looked at, in order'}</span>${S.strandOnly != null ? '<button class="btn2" id="allflows">Show all flows</button>' : ''}`);
-    $('replay').onclick = () => toggleReplay(t);
+    if (S.strandOnly != null) tools('<button class="btn2" id="allflows">Show all flows</button><span>Showing one flow. Click its title again to show all.</span>');
     if ($('allflows')) $('allflows').onclick = () => { S.strandOnly = null; render(); };
   } else if (rp && isQuestion) {
     showEmpty(`<h2>Replaying</h2><p>Step ${rp.upto} of ${t.events.length}: nothing looked at yet.</p>`);
-    tools(`<button class="btn" id="replay">■ Stop</button><span>Step ${rp.upto} of ${t.events.length}</span>`);
-    $('replay').onclick = () => toggleReplay(t);
+  } else if (!ids.size && S.g.note) {
+    showEmpty(`<h2>Wiretap can't map this folder</h2><p>${esc(S.g.note)}</p><p>The steps below and the timeline still follow along.</p>`);
+  } else if (!ids.size && S.sess.cwd && (S.g.root ? !(S.sess.cwd + '/').startsWith(S.g.root + '/') && !(S.g.root + '/').startsWith(S.sess.cwd + '/') : t.events.some(e => e.path && !e.file) && !t.events.some(e => e.file))) {
+    // the session works in a folder this map doesn't cover, so none of its files can be drawn
+    const home = S.g.toolDir?.match(/^\/(Users|home)\/[^/]+/)?.[0];
+    const short = p => home && p.startsWith(home) ? '~' + p.slice(home.length) : p;
+    showEmpty(`<h2>This session is outside the mapped project</h2>
+      <p>Claude is working in <span class="code">${esc(short(S.sess.cwd))}</span>, but Wiretap is mapping <b>${esc(S.g.name)}</b>${S.g.root ? ` (<span class="code">${esc(short(S.g.root))}</span>)` : ''}. Files outside it can't be drawn, so the map stays empty.</p>
+      <p>The steps below and the timeline still follow along. To map this project too, start a second Wiretap with a config for it:</p>
+      <pre>python3 -m wiretap --config path/to/that.config.json serve --port 7879</pre>
+      <p>Or pick a Khaoogully session from the menu on the right.</p>`);
   } else if (!ids.size) {
     showEmpty(`<h2>${t.prompt ? 'Claude is getting started' : 'Waiting'}</h2><p>Files will appear here as Claude reads and edits them.</p>`);
   } else {
     const L = layout([...ids], edges.map(e => [e.a, e.b]));
     const lookedIn = new Map((t.looked || []).map(x => [x.file, x.fns.map(f => fnShort(f.name))]));
-    const nodes = [...ids].map(n => ({ id: n, cls: n.startsWith('new:') ? 'ghost' : (live.cls.get(n) || (reads.includes(n) ? 'read' : '')), badge: live.badge.get(n), badgeColor: live.badgeColor.get(n), stripe: n.startsWith('new:') ? 'var(--ghost)' : undefined, sub: !t.touched[n] && lookedIn.get(n)?.length ? 'looked at ' + lookedIn.get(n).join(', ') : undefined }));
+    const nodes = [...ids].map(n => ({ id: n, cls: n.startsWith('new:') ? 'ghost' : (live.cls.get(n) || (reads.includes(n) ? 'read' : '')), badge: live.badge.get(n), badgeColor: live.badgeColor.get(n), stripe: n.startsWith('new:') ? 'var(--ghost)' : undefined,
+      sub: live.order.includes(n) ? (Object.keys(t.touched[n]?.fns || {}).length ? plural(Object.keys(t.touched[n].fns).length, 'function') + ' changed' : 'edited outside functions')
+        : live.cls.get(n)?.startsWith('up') ? 'uses changed code' : lookedIn.get(n)?.length ? 'looked at ' + lookedIn.get(n).join(', ') : undefined }));
     mountSvg(drawLanes(L, nodes, edges, { maxLabels: 0 }), L.W, L.H);
     wireNodes(n => { if (n.startsWith('new:')) return; go(kindOf(n) === 'file' ? { v: 'file', id: n } : { v: 'map', id: n }); });
   }
   const last = evs[evs.length - 1];
+  if (last && !last.file && ['read', 'run'].includes(last.k) && $('tools').hidden)
+    tools(`<span><b>This step:</b> ${esc(describeStep(last)[0])}. It's outside the code, so nothing on the map lights up for it.</span>`);
   const sm = t.summary;
   const [p, txt] = last ? evText(last) : [[], ''];
   const lastLine = !last ? '' : {
@@ -1098,14 +1463,39 @@ function viewLive() {
   const ti = tasks.indexOf(t);
   const t0 = t.started;
   const fmt = s => { s = Math.max(0, Math.round(s)); return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`; };
+  crumbs([['Live', { v: 'live' }], [trunc(t.prompt || 'Claude session', 90)]]);
+  const N = t.events.length, at = evs.length, playing = !!(S.replay && rp === S.replay);
+  chips([['lilac', 'steps', plural(N, 'step')], ['amber', 'clock', fmt((t.events[N - 1]?.t || t0) - t0)], [t.ended ? 'green' : 'rose', 'dot', t.ended ? 'Finished' : 'Working'], [null, 'file', isQuestion ? 'Question' : 'Changes']].map(c => c && [c[0] || '', c[1], c[2]]));
+  const sb = $('stepper');
+  sb.hidden = !N;
+  const phases = phasesOf(t.events);
+  const curPh = phases.find(ph => at - 1 >= ph.from && at - 1 <= ph.to);
+  sb.innerHTML = `<div class="stepper-h"><b>In this request</b><span>Step ${at} of ${N}${curPh ? ' · ' + esc(curPh.label) : ''}</span></div>
+    <div class="steps" id="steps">${phases.map(ph => `<div class="phase ph-${ph.k} ${ph === curPh ? 'on' : ''}"><div class="ph-h" title="${esc(ph.label)}">${esc(ph.label)}${ph.ev.length > 1 ? ` <small>${ph.ev.length}</small>` : ''}</div><div class="ph-steps">${ph.ev.map((e, j) => { const i = ph.from + j; return `<button class="step k-${e.k} ${i + 1 < at ? 'done' : i + 1 === at ? 'cur' : ''}" data-n="${i + 1}" title="${esc(describeStep(e)[0] + ' · ' + evText(e)[1])}"><span class="n">${i + 1}</span><span class="l">${esc(stepLabel(e))}</span></button>`; }).join('')}</div></div>`).join('')}</div>`;
+  sb.querySelectorAll('.step').forEach(b => b.onclick = () => stepTo(t, +b.dataset.n));
+  const curStep = sb.querySelector('.step.cur'); if (curStep) { const box = $('steps'); box.scrollLeft = curStep.offsetLeft - box.clientWidth / 2 + curStep.offsetWidth / 2; }
+  const nextE = t.events[at];
+  const stepCard = !last ? '' : `<div class="stepcard">
+      <div class="stepcard-h"><b>Step ${at} / ${N}</b><span class="pill ${p[0]}">${esc(p[1])}</span></div>
+      <div class="what">${esc(trunc(describeStep(last)[0], 90))}</div>
+      ${txt && last.k !== 'prompt' && last.k !== 'stop' ? `<div class="path">${esc(trunc(last.k === 'run' ? last.text : txt, 160))}</div>` : ''}
+      <div class="keyidea"><svg viewBox="0 0 16 16"><path d="M8 1.5l1.6 3.9 3.9 1.6-3.9 1.6L8 12.5 6.4 8.6 2.5 7l3.9-1.6z"/></svg><span><b>What this step means</b>${esc(hintFor(last))}</span></div>
+      <div class="nav2"><button class="btn2" id="sback" ${at <= 1 ? 'disabled' : ''}>← Back</button><button class="btn" id="snext" ${at >= N ? 'disabled' : ''}><span>${nextE ? 'Next: ' + esc(trunc(stepLabel(nextE), 22)) : 'Latest step'}</span><span>→</span></button></div>
+      <div class="row-btns"><button class="btn2" id="replay">${playing ? '❚❚ Pause' : '↻ Replay'}</button>${at < N ? '<button class="btn2" id="slatest">Jump to latest</button>' : ''}</div>
+      <div class="keys"><kbd>←</kbd><kbd>→</kbd> step · <kbd>R</kbd> replay · <kbd>Space</kbd> pause</div>
+    </div>`;
+  S.stepNav = d => stepTo(t, at + d);
+  S.replayNav = () => toggleReplay(t);
   const summaryKey = S.sess.id + ':' + ti;
   const sumState = S.summaries[summaryKey];
-  P.innerHTML = `
+  // the session as a short story: one line per phase, each one jumps to its first step
+  const story = phases.length > 2 ? `<div><h3>The story so far</h3><ol class="story">${phases.filter(ph => ph.k !== 'ask' && ph.from < at).map(ph => `<li class="ph-${ph.k} ${ph === curPh ? 'on' : ''}" data-n="${ph.from + 1}"><span class="rng">${ph.from + 1}${ph.to > ph.from ? '–' + (ph.to + 1) : ''}</span><span>${esc(ph.label)}${ph.k === 'explore' ? ` <small>${esc([...new Set(ph.ev.filter(e => e.file).map(fileName))].slice(0, 3).join(', '))}</small>` : ''}</span></li>`).join('')}</ol></div>` : '';
+  P.innerHTML = `${stepCard}${story}
     <div class="row-btns">
-      <select id="sess" aria-label="Session">${S.sessions.map(s => `<option value="${esc(s.id)}" ${s.id === S.sess.id ? 'selected' : ''}>${s.source === 'editor' ? 'Your own edits' : 'Claude · ' + esc(trunc(s.prompt || s.id, 40))}</option>`).join('')}</select>
+      <select id="sess" aria-label="Session">${[...new Set(S.sessions.map(s => s.project))].map(pr => `<optgroup label="${esc(S.sessions.find(s => s.project === pr).projectName || pr)}">${S.sessions.filter(s => s.project === pr).map(s => `<option value="${esc(s.id)}" data-p="${esc(pr)}" ${s.id === S.sess.id ? 'selected' : ''}>${s.source === 'editor' ? 'Your own edits' : 'Claude · ' + esc(trunc(s.prompt || s.id, 40))}</option>`).join('')}</optgroup>`).join('')}</select>
       ${tasks.length > 1 ? `<select id="task" aria-label="Request">${tasks.map((x, i) => `<option value="${i}" ${i === ti ? 'selected' : ''}>${i + 1}. ${esc(trunc(x.prompt || '(no prompt)', 46))}</option>`).join('')}</select>` : ''}
     </div>
-    <div><h2 title="${esc(t.prompt || '')}">${esc(trunc(t.prompt || 'Session', 160))}</h2><p>${t.ended ? 'Finished' : 'Working'} · started ${new Date(t0 * 1000).toLocaleTimeString()}</p></div>
+    <div><h3>This request</h3><p title="${esc(t.prompt || '')}">${esc(trunc(t.prompt || 'Session', 160))}</p><p>${t.ended ? 'Finished' : 'Working'} · started ${new Date(t0 * 1000).toLocaleTimeString()}</p></div>
     <div class="stats" ${answer ? 'hidden' : ''}>
       <div class="stat acc"><b>${sm.edited}</b><span>files edited</span></div>
       <div class="stat down"><b>${sm.created}</b><span>files created</span></div>
@@ -1122,8 +1512,11 @@ function viewLive() {
     ${sumState && sumState !== 'loading' ? `<div class="summary-text">${esc(sumState)}</div>` : ''}
     <div><h3>Timeline</h3><ol class="tl" id="tl">${t.events.map((e, i) => { const [pp, tx] = evText(e); return `<li class="${e.file ? 'click' : ''} ${i === evs.length - 1 ? 'last' : ''}" ${e.text && e.k !== 'prompt' ? `title="${esc(e.text)}"` : ''} ${e.file ? `data-go="${esc(JSON.stringify({ v: 'file', id: e.file }))}"` : ''}><span class="tm">${fmt(e.t - t0)}</span><span class="pill ${pp[0]}">${esc(pp[1])}</span><span class="x">${esc(tx)}</span></li>`; }).join('')}</ol></div>`;
   wireList(P);
+  if ($('sback')) { $('sback').onclick = () => S.stepNav(-1); $('snext').onclick = () => S.stepNav(1); $('replay').onclick = S.replayNav; }
+  if ($('slatest')) $('slatest').onclick = () => stepTo(t, N);
+  P.querySelectorAll('.story li').forEach(li => li.onclick = () => stepTo(t, +li.dataset.n));
   const tl = $('tl'); if (tl) { const at = rp && tl.querySelector('li.last'); if (at) tl.scrollTop = at.offsetTop - tl.clientHeight / 2; else tl.scrollTop = tl.scrollHeight; }
-  $('sess').onchange = e => { S.taskIdx = null; go({ v: 'live', sid: e.target.value }); };
+  $('sess').onchange = e => { S.taskIdx = null; go({ v: 'live', sid: e.target.value, p: e.target.selectedOptions[0].dataset.p }); };
   if ($('task')) $('task').onchange = e => { S.taskIdx = +e.target.value; render(); };
   $('sumbtn').onclick = async () => {
     S.summaries[summaryKey] = 'loading'; render();
@@ -1143,7 +1536,7 @@ function viewTrace() {
   if (S.r.q && S.r.q !== S.traceQ) {
     S.traceQ = S.r.q; S.trace = null;
     $('tq').value = S.traceQ; $('tgo').disabled = true;
-    fetch('/api/search?q=' + encodeURIComponent(S.traceQ)).then(r => r.json()).then(d => { S.trace = d; if (S.r.v === 'trace') render(); });
+    fetch(withP('/api/search?q=' + encodeURIComponent(S.traceQ))).then(r => r.json()).then(d => { S.trace = d; if (S.r.v === 'trace') render(); });
   }
   $('tgo').onclick = run;
   $('tq').onkeydown = e => { if (e.key === 'Enter') run(); };
@@ -1281,7 +1674,23 @@ $('q').addEventListener('keydown', e => {
 });
 $('q').addEventListener('blur', () => setTimeout(() => $('results').hidden = true, 150));
 document.addEventListener('keydown', e => {
-  if (e.key === '/' && document.activeElement.tagName !== 'INPUT' && document.activeElement.tagName !== 'SELECT') { e.preventDefault(); $('q').focus(); }
+  const typing = ['INPUT', 'SELECT', 'TEXTAREA'].includes(document.activeElement.tagName);
+  if (typing || e.metaKey || e.ctrlKey || e.altKey) return;
+  if (e.key === '/') { e.preventDefault(); $('q').focus(); return; }
+  if (e.key === '[' || e.key === ']') { const k = e.key === '[' ? 'side' : 'panel'; setUI({ [k]: !S.ui[k] }); return; }
+  if ((e.key === 'f' || e.key === 'F') && $('vp')) { fitView(true); return; }
+  if (S.r.v !== 'live' || !S.stepNav || (e.key === ' ' && document.activeElement.tagName === 'BUTTON')) return;
+  if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') { e.preventDefault(); S.stepNav(e.key === 'ArrowLeft' ? -1 : 1); }
+  else if (e.key === 'r' || e.key === 'R' || e.key === ' ') { e.preventDefault(); S.replayNav(); }
+});
+function setTheme(t) {
+  if (t) document.documentElement.dataset.theme = t; else delete document.documentElement.dataset.theme;
+  try { t ? localStorage.setItem('wiretap-theme', t) : localStorage.removeItem('wiretap-theme'); } catch { /* storage off */ }
+}
+try { setTheme(localStorage.getItem('wiretap-theme')); } catch { /* storage off */ }
+$('theme').addEventListener('click', () => {
+  const dark = document.documentElement.dataset.theme ? document.documentElement.dataset.theme === 'dark' : matchMedia('(prefers-color-scheme: dark)').matches;
+  setTheme(dark ? 'light' : 'dark');
 });
 document.querySelectorAll('#views button').forEach(b => b.addEventListener('click', () => {
   const v = b.dataset.v;
@@ -1291,18 +1700,33 @@ document.querySelectorAll('#views button').forEach(b => b.addEventListener('clic
 
 // ======================= data loading + live updates =======================
 
-async function loadGraph() {
-  const g = await (await fetch('/api/graph')).json();
+async function loadGraph(p) {
+  const g = await (await fetch('/api/graph' + (p || S.p ? '?p=' + encodeURIComponent(p || S.p) : ''))).json();
+  if (g.empty) { S.g = null; return; }
+  if (g.project !== S.p) {
+    // another project: forget what belonged to the last one
+    Object.assign(S, { openApps: null, sideKey: null, lastMapId: null, trace: null, traceQ: '', strandOnly: null, shown: null, shownKey: null });
+    S.src.clear();
+  }
+  S.p = g.project;
   S.g = g; S.I = buildIndex(g);
   S.I.filesByApp = new Map(); g.files.forEach(f => S.I.filesByApp.set(f.app, (S.I.filesByApp.get(f.app) || 0) + 1));
-  $('proj').textContent = g.name;
   document.title = 'Wiretap · ' + g.name;
+}
+async function loadProjects() {
+  try { S.projects = (await (await fetch('/api/projects')).json()).projects || []; } catch { /* server restarting */ }
+  S.sideKey = null;
 }
 async function loadSession(id) {
   try {
-    const data = await (await fetch('/api/session' + (id ? '?id=' + encodeURIComponent(id) : ''))).json();
+    const data = await (await fetch(id ? '/api/session?id=' + encodeURIComponent(id) : withP('/api/session'))).json();
     S.sess = data.session; S.sessions = data.sessions || [];
   } catch { /* server restarting */ }
+}
+function showWaiting() {
+  $('title').textContent = 'Waiting for Claude Code';
+  showEmpty(`<h2>No project yet</h2><p>Wiretap is running without a config, so it maps whichever project Claude Code works in. Start Claude Code in a project folder; its map appears here on the first tool call.</p>
+    <p>Not connected yet? Run this once:</p><pre>python3 -m wiretap install-hooks</pre>`);
 }
 let graphTimer = null;
 function connect() {
@@ -1310,31 +1734,44 @@ function connect() {
   const st = $('status');
   es.onopen = () => { st.classList.add('on'); st.querySelector('span').textContent = 'live'; };
   es.onerror = () => { st.classList.remove('on'); st.querySelector('span').textContent = 'reconnecting'; };
-  es.onmessage = ev => {
+  es.onmessage = async ev => {
     const msg = JSON.parse(ev.data);
-    if (msg.type === 'graph') {
+    if (msg.type === 'projects') {
+      await loadProjects();
+      if (!S.g) { await loadGraph(); await loadSession(null); }
+      if (S.g) render();
+    } else if (msg.type === 'graph') {
+      if (msg.project !== S.p) return;
       clearTimeout(graphTimer);
       graphTimer = setTimeout(async () => { await loadGraph(); render(); }, 250);
     } else if (msg.type === 'session') {
       // a link with sid (the terminal button) pins the Live view to that one session
+      const m = msg.session;
       const pinned = S.r.v === 'live' && S.r.sid;
-      const follow = pinned ? msg.session.id === S.r.sid : (!S.sess || S.sess.id === msg.session.id || S.r.v !== 'live' || msg.session.source === 'claude');
-      if (follow) {
-        S.sess = msg.session;
-        if (!S.sessions.some(s => s.id === msg.session.id)) loadSession(msg.session.id);
-        if (S.r.v !== 'live') S.liveDot = true;
-        render();
+      const follow = pinned ? m.id === S.r.sid : (!S.sess || S.sess.id === m.id || S.r.v !== 'live' || m.source === 'claude');
+      if (!follow) return;
+      if (msg.project !== S.p) {
+        // Claude is working in another project: the Live view follows it there, other views just get the dot
+        if (S.r.v !== 'live') { S.liveDot = true; render(); return; }
+        await loadGraph(msg.project);
       }
+      S.sess = m;
+      if (!S.sessions.some(s => s.id === m.id)) loadSession(m.id).then(() => S.r.v === 'live' && render());
+      if (S.r.v !== 'live') S.liveDot = true;
+      render();
     }
   };
 }
 
 (async function start() {
   S.r = parseRoute();
-  try { await loadGraph(); }
-  catch (e) { showEmpty('<h2>Could not reach the Wiretap server</h2><p>Start it with <code>python3 -m wiretap serve</code>.</p>'); return; }
-  await loadSession(S.r.v === 'live' ? S.r.sid : null);
-  render();
+  try {
+    await loadProjects();
+    if (S.r.v === 'live' && S.r.sid) await loadSession(S.r.sid);
+    await loadGraph((S.r.v === 'live' && S.sess?.project) || S.r.p);
+  } catch (e) { showEmpty('<h2>Could not reach the Wiretap server</h2><p>Start it with <code>python3 -m wiretap serve</code>.</p>'); return; }
+  if (!(S.r.v === 'live' && S.r.sid)) await loadSession(null);
+  if (S.g) render(); else showWaiting();
   if (!location.search.includes('static')) connect();  // ?static: no live updates (for screenshots)
 })();
 

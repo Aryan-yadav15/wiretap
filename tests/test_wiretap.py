@@ -174,6 +174,45 @@ class TestLiveSession(FixtureCase):
         self.assertEqual(ed.touched["f:api:app/database.py"]["fns"], {"close_db": "added"})
 
 
+class TestProjects(FixtureCase):
+    """A Claude session in a folder with no config gets that folder mapped on its own."""
+
+    def test_session_in_another_folder(self):
+        other = os.path.join(self.tmp, "wt-other-proj")
+        os.makedirs(os.path.join(other, "src"))
+        with open(os.path.join(other, "package.json"), "w") as fh:
+            json.dump({"name": "other-app"}, fh)
+        with open(os.path.join(other, "src", "main.ts"), "w") as fh:
+            fh.write("export function greet(name: string) {\n  return 'hi ' + name;\n}\n")
+        state = State(self.config)
+        try:
+            state.on_hook({"session_id": "o1", "cwd": other, "hook_event_name": "UserPromptSubmit", "prompt": "hi"})
+            state.on_hook({"session_id": "o1", "cwd": other, "hook_event_name": "PostToolUse", "tool_name": "Read",
+                           "tool_input": {"file_path": os.path.join(other, "src", "main.ts")}})
+            ps = state.projects["wt-other-proj"]
+            self.assertTrue(ps.auto)
+            self.assertEqual([a["name"] for a in ps.graph["apps"]], ["other-app"])
+            ev = ps.snapshot(ps.sessions.by_id["o1"])["tasks"][-1]["events"]
+            self.assertEqual(ev[-1]["file"], "f:wt-other-proj:src/main.ts")
+            self.assertNotIn("o1", state.sessions.by_id)  # the config's project is untouched
+            # a session inside the configured project still lands there
+            state.on_hook({"session_id": "c1", "cwd": os.path.join(self.root, "backend"), "hook_event_name": "UserPromptSubmit", "prompt": "x"})
+            self.assertIn("c1", state.sessions.by_id)
+        finally:
+            shutil.rmtree(state.projects["wt-other-proj"].project.cache_dir, ignore_errors=True)
+
+
+class StyleTest(unittest.TestCase):
+    """Stylesheets are reported per rule, like code is per function."""
+
+    def test_rules(self):
+        from wiretap.style_extract import extract
+        src = "/* top */\n.a { color: red }\n@media (max-width: 600px) {\n  .a { color: blue }\n}\n@keyframes spin { to { rotate: 1turn } }\n"
+        names = [(f["name"], f["line"]) for f in extract(src, "s.css")["functions"]]
+        self.assertEqual(names, [(".a", 2), ("@media (max-width: 600px) › .a", 4), ("@keyframes spin", 6)])
+        self.assertEqual(extract("<p>hi</p>", "index.html")["functions"], [])
+
+
 class TestHttp(FixtureCase):
     def test_hook_endpoint_and_stream(self):
         state = State(self.config)
