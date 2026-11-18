@@ -139,11 +139,12 @@ def main(argv=None):
         return install(a.settings, a.port, a.dry_run)
     if a.cmd == "uninstall-hooks":
         return uninstall(a.settings)
-    if a.cmd in (None, "serve", "index") and not os.path.exists(a.config):
+    config = a.config if os.path.exists(a.config) else None
+    if not config and (a.cmd == "index" or a.config != DEFAULT_CONFIG):
         print(f"No config at {a.config}.\nCopy wiretap.config.example.json to wiretap.config.json and list your project's apps "
               "(see \"Configure your project\" in the README).", file=sys.stderr)
         return 1
-    if a.cmd in (None, "serve", "index") and _missing_folders(a.config):
+    if config and a.cmd in (None, "serve", "index") and _missing_folders(config):
         return 1
     if a.cmd == "index":
         from .graph import Project
@@ -173,7 +174,8 @@ def main(argv=None):
             import webbrowser
             port = getattr(a, "port", None) or 7878
             threading.Timer(2.5, lambda: webbrowser.open(f"http://127.0.0.1:{port}")).start()
-        serve(a.config, getattr(a, "port", None))
+        # without a config, every project is set up the first time Claude Code works in it
+        serve(config, getattr(a, "port", None))
         return
     ap.print_help()
 
