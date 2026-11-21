@@ -183,6 +183,7 @@ class Task:
         self.looked = {}            # file id -> {function: "read" | "found"}, newest last
         self.tests = None
         self.plan_text = None
+        self.running = None         # {"text", "t"}: a shell command Claude started that hasn't returned yet
 
 
 class Session:
@@ -323,6 +324,7 @@ class Sessions:
         if name in ("Stop", "SubagentStop"):
             if name == "Stop":
                 task.ended = now
+                task.running = None
                 self._event(sess, task, "stop")
             return True
         if name not in ("PostToolUse", "PreToolUse"):
@@ -333,7 +335,11 @@ class Sessions:
         if name == "PreToolUse":
             if tool == "Bash":
                 sess.last_shell = now
+                # only PostToolUse records the step, so show a slow command (a DB query, a build) while it runs
+                task.running = {"text": re.sub(r"^\s*cd\s+\S+\s*&&\s*", "", ti.get("command") or "")[:300], "t": now}
+                return True
             return False
+        task.running = None
 
         path = ti.get("file_path") or ti.get("notebook_path")
         if tool == "ExitPlanMode" or (tool in ("Write", "Edit") and path and "/.claude/plans/" in path):
@@ -405,7 +411,8 @@ class Sessions:
             seen_in, read_in = fns_by_file(lines), fns_by_file(ranges)
             named = list(dict.fromkeys(f for f in (ids[p][0] for p in named) if f))
             hits = [f for f in dict.fromkeys(ids[p][0] for p in hits) if f]
-            text = re.sub(r"^\s*cd\s+\S+\s*&&\s*", "", cmd)[:300]
+            # kept long: the page reads table names out of DB queries, which come after the connection setup
+            text = re.sub(r"^\s*cd\s+\S+\s*&&\s*", "", cmd)[:2000]
             if search:
                 # sed/head reads sharing the command with a grep get their own read events
                 for fid, names in read_in.items():
@@ -512,7 +519,7 @@ class Sessions:
             "prompt": t.prompt, "started": t.started, "ended": t.ended,
             "events": t.events, "planned": sorted(t.planned), "planned_new": t.planned_new, "plan": t.plan_text,
             "touched": {f: {k: v for k, v in r.items() if k != "baseline"} for f, r in t.touched.items()},
-            "reads": sorted(t.reads), "tests": t.tests,
+            "reads": sorted(t.reads), "tests": t.tests, "running": t.running,
             "looked": [{"file": f, "fns": [{"name": q, "how": r["how"], "score": round(r["score"], 2)} for q, r in rec.items()]} for f, rec in t.looked.items()],
             "ripple_files": sorted(ripple_files), "ripple_fns": sorted(ripple_fns)[:400],
             "summary": {

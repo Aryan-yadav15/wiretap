@@ -1291,6 +1291,8 @@ const isShot = e => e.k === 'read' && !e.file && /\.(png|jpe?g|webp|gif)$/i.test
 // what a shell command is for, in a few words (env assignments like S=/tmp/x && are skipped)
 function shellWhat(cmd) {
   const c = String(cmd || '').replace(/^\s*(\w+=\S+\s*(&&|;)?\s*)+/, '');
+  if (/\/rest\/v1\//.test(cmd)) return 'Queried Supabase';
+  if (/\b(psql|sqlite3|mysql)\b/.test(cmd)) return 'Queried the database';
   if (/playwright|puppeteer|screenshot|\bshot\w*\.mjs|\bseq\w*\.mjs|\bsips\b/.test(cmd)) return 'Took screenshots';
   if (/\b(curl|wget)\b/.test(c)) return 'Downloaded a file';
   if (/\b(npm|pnpm|yarn) (run )?build\b|\bvite build\b|\bnext build\b|\btsc\b/.test(c)) return 'Built the app';
@@ -1307,6 +1309,13 @@ function searchWords(p) {
   return w.length ? [...new Set(w)].slice(0, 3).join(', ') : 'a code pattern';
 }
 const fileName = e => e.file ? labelOf(e.file) : (e.path || '').split('/').pop();
+// tables a shell command queried: SQL `from x` / `join x` / `update x` / `into x`, or Supabase `/rest/v1/x`
+function queriedTables(cmd) {
+  const s = String(cmd || ''), sql = new Set(), rest = new Set();
+  for (const m of s.matchAll(/\b(?:from|join|update|into)\s+"?(?:public\.)?"?(\w+)/gi)) sql.add(m[1].toLowerCase());
+  for (const m of s.matchAll(/\/rest\/v1\/(\w+)/g)) rest.add(m[1].toLowerCase());
+  return S.g.nodes.filter(n => n.kind === 'table' && (sql.has(String(n.label).toLowerCase()) || n.db === 'supabase' && rest.has(String(n.label).toLowerCase())));
+}
 // [headline, short label for the step bar]
 function describeStep(e) {
   const f = fileName(e);
@@ -1425,7 +1434,16 @@ function viewLive() {
       <p>Claude is working in <span class="code">${esc(short(S.sess.cwd))}</span>, but Wiretap is mapping <b>${esc(S.g.name)}</b>${S.g.root ? ` (<span class="code">${esc(short(S.g.root))}</span>)` : ''}. Files outside it can't be drawn, so the map stays empty.</p>
       <p>The steps below and the timeline still follow along. To map this project too, start a second Wiretap with a config for it:</p>
       <pre>python3 -m wiretap --config path/to/that.config.json serve --port 7879</pre>
-      <p>Or pick a Khaoogully session from the menu on the right.</p>`);
+      <p>Or pick a ${esc(S.g.name)} session from the menu on the right.</p>`);
+  } else if (!ids.size && t.running) {
+    showEmpty(`<h2>Claude is running a command</h2><pre>${esc(trunc(t.running.text, 300))}</pre><p>Started ${esc(new Date(t.running.t * 1000).toLocaleTimeString())}. Its step appears when it returns.</p>`);
+  } else if (!ids.size && (t.ended || evs.some(e => e.k === 'run'))) {
+    // every step so far ran outside the code (DB queries, API calls); name the tables it touched
+    const tables = [...new Map(evs.filter(e => e.k === 'run').flatMap(e => queriedTables(e.text)).map(n => [n.id, n])).values()];
+    const runs = evs.filter(e => e.k === 'run').length;
+    showEmpty(`<h2>${t.ended ? 'Claude finished without opening any code' : 'Claude is working outside the code'}</h2>
+      <p>${plural(runs, 'step')} ran commands${tables.length ? ' that queried data' : ''}, so there are no files to draw.</p>
+      ${tables.length ? `<h3>Tables it queried</h3><ul class="list">${tables.map(n => item(['down', 'table'], esc(n.label), esc(n.dbname) + ' · ' + plural((S.I.inn.get(n.id) || []).length, 'function') + ' use it', null, goAttr({ v: 'map', id: n.id }))).join('')}</ul><p>Click one to see the code that reads and writes it.</p>` : ''}`);
   } else if (!ids.size) {
     showEmpty(`<h2>${t.prompt ? 'Claude is getting started' : 'Waiting'}</h2><p>Files will appear here as Claude reads and edits them.</p>`);
   } else {
@@ -1438,7 +1456,9 @@ function viewLive() {
     wireNodes(n => { if (n.startsWith('new:')) return; go(kindOf(n) === 'file' ? { v: 'file', id: n } : { v: 'map', id: n }); });
   }
   const last = evs[evs.length - 1];
-  if (last && !last.file && ['read', 'run'].includes(last.k) && $('tools').hidden)
+  if (t.running && ids.size && $('tools').hidden)
+    tools(`<span><b>Running now:</b> <span class="code">${esc(trunc(t.running.text, 120))}</span></span>`);
+  else if (last && !last.file && ['read', 'run'].includes(last.k) && $('tools').hidden)
     tools(`<span><b>This step:</b> ${esc(describeStep(last)[0])}. It's outside the code, so nothing on the map lights up for it.</span>`);
   const sm = t.summary;
   const [p, txt] = last ? evText(last) : [[], ''];
