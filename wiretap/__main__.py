@@ -142,7 +142,7 @@ def main(argv=None):
     config = a.config if os.path.exists(a.config) else None
     if not config and (a.cmd == "index" or a.config != DEFAULT_CONFIG):
         print(f"No config at {a.config}.\nCopy wiretap.config.example.json to wiretap.config.json and list your project's apps "
-              "(see \"Configure your project\" in the README).", file=sys.stderr)
+              "(see docs/setup.md#configuration).", file=sys.stderr)
         return 1
     if config and a.cmd in (None, "serve", "index") and _missing_folders(config):
         return 1

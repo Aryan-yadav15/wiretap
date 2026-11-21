@@ -18,9 +18,9 @@ Built while working on a six-app delivery platform (customer web and mobile apps
 ## ▸ See it work
 
 <p align="center">
-  <img src="docs/demo.gif" width="760" alt="Wiretap's Live view replays a recorded Claude Code session that checked whether a new delivery provider fits the architecture: rows appear one flow at a time with numbered boxes, from a Payment tap through createOrder and POST /orders to the instant-dispatch service and Shadowfax functions. One flow is isolated, a function is opened to show where its flow starts and its code, then the System view shows six apps and their backends, and a search opens admin.updateDeliveryPartner."/>
+  <img src="docs/demo.gif" width="760" alt="Wiretap opens on the System view of a six-app project (642 files, 3890 functions). The Live view replays a recorded Claude Code session that checked whether an admin can change cart or order items: 11 steps play back while rows appear one flow at a time, from a Payment tap through CreateOrder, an onDelete through DELETE /admin/orders, and GET /admin/orders/{orderId} through GetOrderDetail to the order tables it reads. Then a search opens DeleteOrder() with where its flow starts and its code."/>
 </p>
-<p align="center"><sub>Real index of a six-app project (638 files). The Live part replays a recorded Claude Code session (prompt typos tidied).</sub></p>
+<p align="center"><sub>Real index of a six-app project (642 files). The Live part is a recorded 3½-minute Claude Code session, fed back in as hook events and played with <b>Replay</b> (prompt typo tidied). Script: <a href="docs/demo/">docs/demo/</a>.</sub></p>
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/capabilities-dark.svg"/>
@@ -60,27 +60,21 @@ More detail, with diagrams of a tool call and of indexing: [docs/architecture.md
 
 ## ▸ Run it
 
-You need Python 3.11+ (tested on 3.11 to 3.15), Node.js (tested on 24.16) and curl. Claude Code is optional: without it you still get every view except Live.
+You need **Python 3.11+** (tested on 3.11 to 3.15), **Node.js** (tested on 24.16) and **curl**. No Python packages and no build step. Claude Code is optional: without it you get every view except Live.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/terminal-dark.svg"/>
   <img src="docs/assets/terminal-light.svg" width="100%" alt="Terminal: clone the repository, npm install, copy the example config, start the server, which reports 638 files, 3831 functions and 8704 links indexed in 1.7 seconds and the address to open, then install the Claude Code hooks."/>
 </picture>
 
-**1 · Install**
+### Quick start (about a minute)
+
+**1 · Install** (TypeScript is the only Node package; it parses `.ts` / `.tsx`)
 
 ```bash
 git clone https://github.com/Aryan-yadav15/wiretap && cd wiretap
 npm install
 ```
-
-No config is needed: the first time Claude Code works in a folder, Wiretap maps it (one app per `package.json` and per `pyproject.toml` / `requirements.txt`, up to 5,000 files), and each project gets its own map. To fix the apps, routes and prefixes for one project, or map it before Claude touches it, write a config:
-
-```bash
-cp wiretap.config.example.json wiretap.config.json   # set root and list the apps
-```
-
-Every key is described in [docs/setup.md](docs/setup.md#configuration).
 
 **2 · Start the map** → http://127.0.0.1:7878
 
@@ -88,13 +82,47 @@ Every key is described in [docs/setup.md](docs/setup.md#configuration).
 python3 -m wiretap serve --open
 ```
 
-**3 · Connect Claude Code (once)**
+**3 · Connect Claude Code (once)**, in a second terminal inside the `wiretap` folder
 
 ```bash
 python3 -m wiretap install-hooks
 ```
 
-This adds the hooks to `~/.claude/settings.json` (after a backup) and the **◉ Wiretap live ↗** button above the Claude Code prompt, plus `/wiretap`. Start a new Claude Code session, press the button, and the Live view opens on that session. `python3 -m wiretap uninstall-hooks` removes all of it.
+This adds the hooks to `~/.claude/settings.json` (after a backup) and puts the **◉ Wiretap live ↗** button above the Claude Code prompt, plus `/wiretap`. The hooks do nothing while the server is down, and the button starts it.
+
+**4 · Use it.** Open a **new** Claude Code session in any of your projects and ask it something. Wiretap maps that folder the first time a hook arrives from it, and the Live view follows the session. Press the button to jump to it.
+
+No config needed: each folder Claude works in gets its own map (one app per `package.json` and per `pyproject.toml` / `requirements.txt`, up to 5,000 code files, never your home folder). The map's cache stays in the Wiretap folder, never in your project.
+
+### Map a project before Claude touches it (optional)
+
+A config fixes the apps, route prefixes and databases for one project, and maps it as soon as the server starts:
+
+```bash
+cp wiretap.config.example.json wiretap.config.json
+```
+
+Set `root` and list the apps (every key is described in [docs/setup.md](docs/setup.md#configuration)), then check what it finds without starting the server:
+
+```bash
+python3 -m wiretap index
+```
+
+<details>
+<summary><b>Troubleshooting</b></summary>
+
+| Problem | Fix |
+|---|---|
+| Live stays on "Waiting" | Hooks load when a session starts: open a **new** Claude Code session after `install-hooks`. |
+| Port 7878 is taken | `python3 -m wiretap serve --port 7879` and `python3 -m wiretap install-hooks --port 7879`. The terminal button still opens 7878 (see [What's next](#-whats-next)). |
+| "too many to map on the fly" | The folder has more than 5,000 code files. Give it a config (above). |
+| "This is your home folder, not a project" | Start Claude Code inside a project folder. |
+| See the settings before writing them | `python3 -m wiretap install-hooks --dry-run` |
+| Remove Wiretap from Claude Code | `python3 -m wiretap uninstall-hooks` removes the hooks and the button. |
+
+Setting `WIRETAP_SKIP=1` in a shell silences the hooks for Claude Code sessions started from it. More in [docs/setup.md](docs/setup.md).
+
+</details>
 
 <details>
 <summary><b>The views</b></summary>
@@ -104,7 +132,7 @@ This adds the hooks to `~/.claude/settings.json` (after a backup) and the **◉ 
 | **System** | Which apps talk to which backends, databases and outside services, with counts, and how complete the map is (unmatched API calls, calls it couldn't follow). |
 | **Map** | One file, table, service or resource in focus. Amber = uses it, teal = it reaches. Click a box to move, click the focused box to look inside, click a line to see the calls behind it. |
 | **Inside a file** | Its functions, who calls in and what they call out to. Click a function for its callers, its calls, **where the flow starts** (a tap, a screen opening, an API route, startup or a scheduled job), and its code. |
-| **Live** | The Claude session as it happens, in whichever project Claude is working in. Steps are grouped into phases (looking around, changing code, checking, done) and each step is told in plain words; step through them with ← → or **Replay**, and the map shows the files as they were at that step: green = edited (numbered in edit order), yellow = uses changed code, flashing = touched last. "The story so far" lists the phases. A question-only session is drawn as one row per flow, numbered in the order Claude looked. **Summarize with Claude** runs `claude -p --model haiku` on the diff only when pressed. Your own edits show up too. |
+| **Live** | The Claude session as it happens, in whichever project Claude is working in. Steps are grouped into phases (looking around, changing code, checking, done) and each step is told in plain words; step through them with ← → or **Replay**, and the map shows the files as they were at that step: green = edited (numbered in edit order), yellow = uses changed code, flashing = touched last. "The story so far" lists the phases. A question-only session is drawn as one row per flow, numbered in the order Claude looked. **Summarize with Claude** runs `claude -p --model haiku` on the diff only when pressed. While a slow command runs (a build, a database query) it shows what is running, and a session that only queried data lists the tables it touched. Your own edits show up too. |
 | **Trace** | Type the words a feature uses (`cod, pay_later, payLater`). Finds every function that uses them as an identifier, plus functions that touch the same feature-specific tables. |
 | **Resources** | Shared things that can stall everything: the worker thread pool, a shared database client, a session pool. Who uses each one. |
 

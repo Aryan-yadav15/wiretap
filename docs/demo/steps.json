@@ -1,0 +1,11 @@
+[
+  { "waitFor": "text=API CALLS MATCHED", "wait": 3000 },
+  { "click": "#live-tab", "wait": 300 },
+  { "waitFor": "text=Claude finished.", "wait": 2500 },
+  { "click": "#replay", "wait": 8500 },
+  { "click": "text=GetOrderDetail() >> nth=0", "wait": 3500 },
+  { "click": "text=System >> nth=0", "wait": 2500 },
+  { "click": "#q", "wait": 300 },
+  { "fill": ["#q", "deleteOrder"], "wait": 1200 },
+  { "press": "Enter", "wait": 4000 }
+]
