@@ -1,0 +1,55 @@
+{
+  "name": "Stacks",
+  "root": ".",
+  "apps": [
+    {
+      "id": "express",
+      "name": "Express API",
+      "lang": "ts",
+      "root": "express-api",
+      "include": [
+        "src"
+      ]
+    },
+    {
+      "id": "next",
+      "name": "Next.js app",
+      "lang": "ts",
+      "root": "next-app",
+      "include": [
+        "app",
+        "pages",
+        "lib"
+      ]
+    },
+    {
+      "id": "web",
+      "name": "Web client",
+      "lang": "ts",
+      "root": "web",
+      "include": [
+        "src"
+      ],
+      "backend": "express"
+    },
+    {
+      "id": "admin",
+      "name": "Admin client",
+      "lang": "ts",
+      "root": "admin",
+      "include": [
+        "src"
+      ],
+      "backend": "flask"
+    },
+    {
+      "id": "flask",
+      "name": "Flask API",
+      "lang": "py",
+      "root": "flask-api",
+      "include": [
+        "app"
+      ]
+    }
+  ]
+}

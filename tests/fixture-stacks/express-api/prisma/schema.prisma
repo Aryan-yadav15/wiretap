@@ -1,0 +1,14 @@
+model Order {
+  id    String      @id
+  items OrderItem[]
+
+  @@map("orders")
+}
+
+model OrderItem {
+  id      String @id
+  orderId String
+  order   Order  @relation(fields: [orderId], references: [id])
+
+  @@map("order_items")
+}

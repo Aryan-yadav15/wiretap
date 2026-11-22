@@ -2,6 +2,7 @@
 
   python3 -m wiretap serve            index the project, watch it, open the map at http://127.0.0.1:7878
   python3 -m wiretap index            index once and print what was found
+  python3 -m wiretap describe         write plain-English names for the whole project ahead of time (uses claude -p)
   python3 -m wiretap install-hooks    send Claude Code activity to the map (edits ~/.claude/settings.json)
   python3 -m wiretap uninstall-hooks  remove those hooks again
 """
@@ -119,6 +120,45 @@ def _missing_folders(config):
     return bool(missing)
 
 
+def explain(p, g, path):
+    """Print what one file gave the map: its functions, each adapter's records, and the routes and links made from them."""
+    app, rel = p.locate(os.path.abspath(path))
+    if not app or rel not in app.extract:
+        print(f"{path} is not in any app of this project (or is not a Python / TypeScript file).", file=sys.stderr)
+        return 1
+    x, fid = app.extract[rel], f"f:{app.id}:{rel}"
+    print(f"{rel}  ({app.name}, {x.get('lang')})" + (f"  parse error: {x['error']}" if x.get("error") else ""))
+    fns = x.get("functions", [])
+    print(f"  functions ({len(fns)}): " + ", ".join(f"{f['name']} :{f['line']}" for f in fns[:30]) + (" …" if len(fns) > 30 else ""))
+    show = {
+        "routes": lambda r: f"{r['method']} {r['path'] or '/'} -> {r.get('fn') or r.get('target') or '(no handler)'}",
+        "includes": lambda r: f"{r['parent']} mounts {r.get('child') or r.get('spec')} at '{r['prefix']}'",
+        "tables": lambda r: f"{r['op']} {r['table']} in {r['fn']}",
+        "http": lambda r: f"{r['method']} {''.join(q.get('s', '{}') for q in (r.get('url') or []))} from {r['from']}",
+        "http_out": lambda r: f"{r['url']} from {r['fn']}",
+        "spawns": lambda r: f"{r['kind']}: {r['target']}",
+        "resources": lambda r: f"{r['res']} in {r['fn']}",
+    }
+    for kind, fmt in show.items():
+        for r in x.get(kind, []):
+            print(f"  {kind:<9} [{r.get('via', 'core')}] {fmt(r)}  (line {r.get('line', '?')})")
+    if x.get("model_tables"):
+        print("  models    [sqlalchemy] " + ", ".join(f"{k} = {v}" for k, v in x["model_tables"].items()))
+    routes = [n["label"] + (f" -> {n['fn'].split('#')[-1]}" if n.get("fn") else "") for n in g["nodes"] if n.get("kind") == "route" and n.get("file") == fid]
+    if routes:
+        print("  on the map, routes: " + "; ".join(routes))
+    own = {f["id"] for f in g["fns"] if f["file"] == fid}
+    kinds = {}
+    for e in g["edges"]:
+        if e["s"] in own:
+            kinds[e["k"]] = kinds.get(e["k"], 0) + 1
+    print("  on the map, links out: " + (", ".join(f"{n} {k}" for k, n in sorted(kinds.items())) or "none"))
+    lost = [k for k in g["unresolved"] if k[0].startswith(app.id + ":")]
+    if lost:
+        print(f"  calls this app could not follow (top): " + ", ".join(f"{k.split(': ', 1)[1]} x{n}" for k, n in lost[:8]))
+    return 0
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="wiretap", description="Visual map of how a codebase connects, live while Claude Code works.")
     ap.add_argument("--config", default=os.environ.get("WIRETAP_CONFIG", DEFAULT_CONFIG))
@@ -126,7 +166,12 @@ def main(argv=None):
     s = sub.add_parser("serve", help="index, watch and serve the map")
     s.add_argument("--port", type=int)
     s.add_argument("--open", action="store_true", help="open the browser")
-    sub.add_parser("index", help="index once and print a report")
+    ix = sub.add_parser("index", help="index once and print a report")
+    ix.add_argument("--explain", metavar="FILE", help="show what the parser and each adapter found in one file")
+    ix.add_argument("--root", metavar="FOLDER", help="map a folder without a config, the way the server does for Claude's folders")
+    d = sub.add_parser("describe", help="write plain-English names for Simple mode ahead of time (claude -p, haiku)")
+    d.add_argument("--root", metavar="FOLDER", help="a folder without a config, as the server maps Claude's folders")
+    d.add_argument("--yes", action="store_true", help="don't ask before calling the model")
     i = sub.add_parser("install-hooks", help="send Claude Code activity to the map")
     i.add_argument("--settings", default=os.path.expanduser("~/.claude/settings.json"))
     i.add_argument("--port", type=int, default=7878)
@@ -140,26 +185,41 @@ def main(argv=None):
     if a.cmd == "uninstall-hooks":
         return uninstall(a.settings)
     config = a.config if os.path.exists(a.config) else None
-    if not config and (a.cmd == "index" or a.config != DEFAULT_CONFIG):
+    if a.cmd in ("index", "describe") and a.root:
+        config = None
+    elif not config and (a.cmd in ("index", "describe") or a.config != DEFAULT_CONFIG):
         print(f"No config at {a.config}.\nCopy wiretap.config.example.json to wiretap.config.json and list your project's apps "
               "(see docs/setup.md#configuration).", file=sys.stderr)
         return 1
-    if config and a.cmd in (None, "serve", "index") and _missing_folders(config):
+    if config and a.cmd in (None, "serve", "index", "describe") and _missing_folders(config):
         return 1
+    if a.cmd == "describe":
+        return describe(a)
     if a.cmd == "index":
         from .graph import Project
         t0 = time.time()
-        p = Project(a.config)
+        if a.root:
+            import tempfile
+            from .graph import autodetect
+            cfg, why = autodetect(os.path.abspath(a.root))
+            if why:
+                print(why, file=sys.stderr)
+                return 1
+            p = Project(cfg=cfg, cache_dir=os.path.join(tempfile.gettempdir(), "wiretap-index-cache"))
+        else:
+            p = Project(a.config)
         p.load_cache()
         p.scan()
         p.save_cache()
         g = p.build()
         st = g["stats"]
         print(f"{g['name']}: {st['files']} files, {st['functions']} functions, {st['edges']} links in {time.time() - t0:.1f}s")
-        for app in g["apps"]:
-            n = sum(1 for f in g["files"] if f["app"] == app["id"])
-            print(f"  {app['name']:<24} {n:>4} files")
-        print(f"  API calls matched to a route: {st.get('http_matched', 0)}, unmatched: {st.get('http_unmatched', 0)}")
+        if a.explain:
+            return explain(p, g, a.explain)
+        from .coverage import lines
+        print("What Wiretap understood:")
+        for line in lines(g["coverage"]):
+            print(line)
         for u in g["unmatched_http"][:20]:
             print(f"    no route: {u['call']}  ({u['app']} {u['file']}:{u['line']})")
         print(f"  Calls the map could not follow: {st.get('unresolved_calls', 0)}")
@@ -178,6 +238,58 @@ def main(argv=None):
         serve(config, getattr(a, "port", None))
         return
     ap.print_help()
+
+
+def describe(a):
+    """Fill the Simple-mode cache for every file whose functions changed since they were last described."""
+    import re
+    import threading
+    from .graph import Project, autodetect
+    from .simplify import Describer, jobs_for
+    if a.root:
+        root = os.path.abspath(a.root)
+        cfg, why = autodetect(root)
+        if why:
+            print(why, file=sys.stderr)
+            return 1
+        # the same cache folder the server uses for this folder, so the map picks the names up
+        pid = re.sub(r"[^a-z0-9]+", "-", os.path.basename(root).lower()).strip("-") or "project"
+        p = Project(cfg=cfg, cache_dir=os.path.join(HERE, ".wiretap-cache", "auto", pid))
+    else:
+        p = Project(a.config)
+    p.load_cache()
+    p.scan()
+    p.save_cache()
+    g = p.build()
+    d = Describer(p.cache_dir)
+
+    def text_of(fid):
+        _, app_id, rel = fid.split(":", 2)
+        try:
+            with open(os.path.join(p.app_by_id[app_id].root, rel), encoding="utf-8", errors="replace") as fh:
+                return fh.read().splitlines()
+        except OSError:
+            return []
+    jobs = jobs_for(g, [f["id"] for f in g["files"]], text_of, {x["id"]: x["name"] for x in g["apps"]}, d)
+    print(f"{g['name']}: {len(jobs)} of {len(g['files'])} files need a description (one claude -p --model haiku call each).")
+    if not jobs:
+        return
+    if not a.yes and input("Continue? [y/N] ").strip().lower() not in ("y", "yes"):
+        return
+    left, failed, lock, finished = [len(jobs)], [], threading.Lock(), threading.Event()
+
+    def done(fid, res, err):
+        with lock:
+            left[0] -= 1
+            if err:
+                failed.append((fid, err))
+            print(f"  {'!' if err else '✓'} {fid.split(':', 2)[2]}{'  ' + err if err else ''}  ({left[0]} left)")
+            if not left[0]:
+                finished.set()
+    d.describe_async(jobs, done)
+    finished.wait()
+    print(f"Done: {len(jobs) - len(failed)} described, {len(failed)} failed.")
+    return 1 if failed else None
 
 
 if __name__ == "__main__":

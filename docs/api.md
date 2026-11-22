@@ -4,12 +4,13 @@ Wiretap has a CLI and a small HTTP API on `http://127.0.0.1:7878` (localhost onl
 
 ## CLI
 
-All commands take `--config <file>` (default `wiretap.config.json`, or `$WIRETAP_CONFIG`). Only `index` needs one; `serve` without one maps each folder Claude Code works in. Defined in [`wiretap/__main__.py`](../wiretap/__main__.py).
+All commands take `--config <file>` (default `wiretap.config.json`, or `$WIRETAP_CONFIG`). Only `index` needs one, unless it is given `--root`; `serve` without one maps each folder Claude Code works in. Defined in [`wiretap/__main__.py`](../wiretap/__main__.py).
 
 | Command | Options | Does |
 |---|---|---|
 | `python3 -m wiretap serve` | `--port N`, `--open` | index the config's project (if any), watch for changes, serve the UI and API, and map new folders as Claude works in them |
-| `python3 -m wiretap index` | | index once and print a report: files per app, API calls matched / unmatched, calls that couldn't be followed, parse errors |
+| `python3 -m wiretap index` | `--explain FILE`, `--root FOLDER` | index once and print what was understood per app (routes, tables, HTTP calls and jobs by adapter, HTTP calls matched to a route), code in other languages and libraries no adapter reads, unmatched API calls, calls that couldn't be followed, parse errors. `--explain` shows one file instead: its functions, every adapter record, and the routes and links made from them. `--root` maps a folder without a config, the way the server maps the folders Claude works in. |
+| `python3 -m wiretap describe` | `--root FOLDER`, `--yes` | write the plain-English names Simple mode shows, ahead of time, for every file whose functions changed since they were last described: one `claude -p --model haiku` call per file. Asks first unless `--yes`. With `--root`, fills the same cache the server uses for that folder. ([ADR 0006](decisions/0006-simplify-layer.md)) |
 | `python3 -m wiretap install-hooks` | `--settings <file>`, `--port N`, `--dry-run` | add the hooks and the terminal button to Claude Code's settings (backup first) |
 | `python3 -m wiretap uninstall-hooks` | `--settings <file>` | remove exactly what `install-hooks` added |
 
@@ -45,6 +46,10 @@ The whole graph of one project, or `{"empty": true}` before any project is mappe
   "nodes": [ { "id": "rt:customer-api:GET /", "kind": "route", "method": "GET", "path": "/", "fn": "fn:customer-api:app/main.py#HealthCheck", … }, … ],
   "edges": [ { "s": "fn:customer-api:app/database.py#GetSupabaseClientWithAuth", "t": "fn:customer-api:app/database.py#_UserClient.__init__", "k": "call", "line": 160 }, … ],
   "unmatched_http": [], "unresolved": { … }, "timings": { … }, "generated": 1794927000.0, "toolDir": "…",
+  "imports": { "f:customer-web:src/App.tsx": ["f:customer-web:src/services/api.ts", …], … },
+  "coverage": { "apps": [ { "id": "customer-api", "files": 118, "functions": 1180, "found": { "routes": { "fastapi": 212 }, "tables": { "supabase": 640 } },
+                            "http": { "calls": 0, "matched": 0, "unmatched": 0, "unknown_url": 0 }, "calls_not_followed": 40, … }, … ],
+                "not_parsed": [ { "lang": "Go", "files": 14 } ], "not_read": [ { "app": "web", "dep": "drizzle-orm", "what": "Drizzle queries" } ] },
   "root": "/Users/…/khaoogully", "project": "khaoogully", "auto": false, "note": null
 }
 ```
@@ -96,6 +101,7 @@ Server-sent events for every project. Each message is JSON:
 - `{"type": "graph", "project": "<id>", "version": N}`: that project's graph changed (fetch `/api/graph?p=<id>` again).
 - `{"type": "session", "project": "<id>", "session": {…}}`: the same session object as above.
 - `{"type": "projects"}`: a new folder was mapped (fetch `/api/projects` again).
+- `{"type": "describe", "project": "<id>", "file": "<file id>", "fns": {…}, "files": {…}}`: one file was described for Simple mode (same shape as `GET /api/describe`), or `{…, "error": "…"}` when that failed.
 
 Defined in [`server.py:422`](../wiretap/server.py#L422).
 
@@ -118,4 +124,26 @@ curl -s -X POST -H 'Content-Type: application/json' \
 
 ## `POST /api/summarize`
 
-Body `{"session": "<id>", "task": <index>}`. Runs `claude -p --model haiku` on the task's git diff and returns `{"text": "…"}`. When the task changed nothing it returns a fixed text without calling Claude. Errors come back as `{"error": "…"}` (unknown session, no `claude` on PATH, timeout after 3 minutes). This is the only call that uses tokens. Defined in [`server.py:194`](../wiretap/server.py#L194).
+Body `{"session": "<id>", "task": <index>}`. Runs `claude -p --model haiku` on the task's git diff and returns `{"text": "…"}`. When the task changed nothing it returns a fixed text without calling Claude. Errors come back as `{"error": "…"}` (unknown session, no `claude` on PATH, timeout after 3 minutes). Besides Simple mode (below), this is the only call that uses tokens. Defined in [`server.py:194`](../wiretap/server.py#L194).
+
+## Simple mode: `GET /api/describe`, `POST /api/describe`, `POST /api/flow`
+
+Plain-English names over the parsed map ([ADR 0006](decisions/0006-simplify-layer.md)). The parser owns the structure; a model only names files, functions and flow steps. Descriptions are cached in `describe.json` beside the extraction cache, each function's against its hash, so changed code is described again the next time it is shown. Defined in [`wiretap/simplify.py`](../wiretap/simplify.py) and `ProjectState.describe` / `ProjectState.flow` in [`server.py`](../wiretap/server.py).
+
+`GET /api/describe[?p=<project id>]` returns what is already described and still matches the code. No model call.
+
+```json
+{"fns": {"fn:api:app/routers/orders.py#create_order": {"n": "Places a new order", "t": "Prices the items, applies the payment method, and stores the order total."}},
+ "files": {"f:api:app/routers/orders.py": {"n": "Order endpoints", "t": "Lets customers place a new order and look up an existing one by ID."}}}
+```
+
+`POST /api/describe` with `{"p": "<project id>", "files": ["<file id>", …]}` queues up to 24 files that need a description, in the order given (the UI puts the file in focus first), and answers `{"queued": [<file ids>]}` at once. Files already described are left out. Each result arrives as a `describe` event on `/api/stream`. One `claude -p --model haiku` call per file (files with more than 20 functions are split into calls run side by side), asking only about functions whose code changed; names for functions the parser didn't find are dropped. Up to 8 calls run at once; set `WIRETAP_DESCRIBE_WORKERS` to change that.
+
+`POST /api/flow` with `{"p": "<project id>", "ids": [<trigger, route, function and table ids, in flow order>]}` cuts the flow into steps where the layer changes (screen, UI, client, route, logic, data), describes the flow's files if needed, then makes one call to name the steps. It answers when done:
+
+```json
+{"title": "Placing an order prices items and stores the total",
+ "steps": [{"name": "Place a new order", "layer": "route", "ids": ["rt:api:POST /api/orders", "fn:api:app/routers/orders.py#create_order"]}]}
+```
+
+A response that doesn't name every step is rejected. Errors come back as `{"error": "…"}` (no `claude` on PATH, timeout, an answer that isn't JSON).

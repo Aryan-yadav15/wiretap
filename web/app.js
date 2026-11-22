@@ -1,5 +1,5 @@
 'use strict';
-// Wiretap UI. Talks to the local server: /api/graph, /api/session, /api/source, /api/search, /api/stream (SSE).
+// Wiretap UI. Talks to the local server: /api/graph, /api/session, /api/source, /api/search, /api/describe, /api/flow, /api/stream (SSE).
 
 const $ = id => document.getElementById(id);
 const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
@@ -14,7 +14,9 @@ const S = {
   g: null, I: null, r: { v: 'system' },
   sess: null, sessions: [], taskIdx: null, liveDot: false,
   trace: null, traceQ: '', summaries: {}, src: new Map(), sse: false,
-  moved: new Map(), sel: new Set(), ui: { side: true, panel: true, closed: [] },
+  moved: new Map(), sel: new Set(), ui: { side: true, panel: true, closed: ['steps'] },
+  desc: { fns: {}, files: {} }, descBusy: new Set(), descFailed: new Set(), descErr: null, flows: new Map(),
+  descRound: { total: 0, done: 0 }, justNamed: new Set(),
 };
 
 // ======================= index =======================
@@ -65,15 +67,17 @@ function appOf(id) {
 }
 const appName = a => S.I.apps.get(a)?.name || a || '';
 function fnShort(name) { const p = name.split('.'); return p.length > 2 ? p.slice(-2).join('.') : name; }
-function labelOf(id) {
+function labelOf(id, raw) {
   const k = kindOf(id);
-  if (k === 'file') return S.I.files.get(id)?.label || id;
+  if (!raw && S.ui.simple) { const d = descOf(id); if (d) return d.n; }
+  if (k === 'file') return S.I.files.get(id)?.label || id.split('/').pop();  // a file newer than the loaded map
   if (k === 'fn') return fnShort(S.I.fns.get(id)?.name || id) + (S.I.fns.get(id)?.kind === 'component' ? '' : '()');
   if (k === 'new') return id.slice(4).split('/').pop();
   return S.I.nodes.get(id)?.label || id;
 }
 function subOf(id) {
   const k = kindOf(id);
+  if (S.ui.simple && descOf(id)) return labelOf(id, true);  // the code's own name stays under the plain one
   if (k === 'file') { const f = S.I.files.get(id); const d = f.rel.split('/').slice(0, -1).join('/'); return trunc(d, 34) || '.'; }
   if (k === 'fn') return S.I.files.get(fileOfFn(id))?.label || '';
   if (k === 'new') return 'new file (planned)';
@@ -84,6 +88,104 @@ function subOf(id) {
   if (n.kind === 'route') return n.missing ? 'No backend route matches' : appName(n.app);
   if (n.kind === 'trigger') return 'Where it starts';
   return n.kind || '';
+}
+// ---------- Simple mode (ADR 0006): plain-English names written by a model, over the parsed map ----------
+// The model never adds or moves a link; it only names files, functions and flow steps. Cached by function hash.
+function descOf(id) {
+  const k = kindOf(id);
+  return k === 'fn' ? S.desc.fns[id] : k === 'file' ? S.desc.files[id] : null;
+}
+const aiNote = id => S.ui.simple && descOf(id)?.t ? `<p class="ai-note"><span class="pill ai">AI</span>${esc(descOf(id).t)}</p>` : '';
+// box state while Simple is on: waiting for a name (pulses) or just named (flashes once)
+function descCls(id) {
+  if (!S.ui.simple || !id) return '';
+  const k = kindOf(id), f = k === 'fn' ? fileOfFn(id) : k === 'file' ? id : null;
+  return !f ? '' : S.descBusy.has(f) ? ' describing' : S.justNamed.has(f) ? ' named' : '';
+}
+// set those states on the boxes already drawn, without redrawing the canvas
+function markDescribing() {
+  const svg = $('svg'); if (!svg) return;
+  svg.querySelectorAll('.node[data-id], .row[data-self], .row[data-go]').forEach(el => {
+    let id = el.dataset.self || el.dataset.id;
+    if (!id && el.dataset.go) { try { id = JSON.parse(el.dataset.go).id; } catch { return; } }
+    const c = descCls(id).trim();
+    el.classList.toggle('describing', c === 'describing');
+  });
+}
+async function loadDescriptions() {
+  try {
+    const d = await (await fetch(withP('/api/describe'))).json();
+    if (d.fns && d.files) S.desc = d;  // a server older than Simple mode answers 404
+  } catch { /* server restarting */ }
+}
+function toggleSimple() {
+  S.descFailed.clear(); S.descErr = null;
+  setUI({ simple: !S.ui.simple });
+  render();
+}
+// describe the files drawn on the canvas that have no description yet (results arrive over SSE, one file at a time)
+function describeOnScreen() {
+  if (!S.ui.simple || !S.g || !$('vp')) return;
+  const files = new Set();
+  const add = id => { if (!id) return; const k = kindOf(id); const f = k === 'fn' ? fileOfFn(id) : k === 'file' ? id : null; if (f && S.I.files.has(f)) files.add(f); };
+  $('svg').querySelectorAll('[data-id],[data-self]').forEach(el => { add(el.dataset.id); add(el.dataset.self); });
+  $('svg').querySelectorAll('[data-go]').forEach(el => { try { add(JSON.parse(el.dataset.go).id); } catch { /* not a link */ } });
+  // what's in focus first: the server describes files in the order asked
+  const focus = S.r.id && (kindOf(S.r.id) === 'fn' ? fileOfFn(S.r.id) : S.r.id);
+  const first = [focus, S.r.fn && fileOfFn(S.r.fn)].filter(f => f && S.I.files.has(f));
+  const want = [...new Set([...first, ...files])].filter(f => !S.desc.files[f] && !S.descBusy.has(f) && !S.descFailed.has(f)).slice(0, 24);
+  if (!want.length) return;
+  want.forEach(f => S.descBusy.add(f));
+  clearTimeout(roundTimer);
+  if (!S.descRound.total) S.descRound = { total: 0, done: 0 };
+  markDescribing();
+  cvTools();
+  fetch('/api/describe', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ p: S.p, files: want }) })
+    .then(r => r.json()).then(async res => {
+      if (res.error) { S.descErr = res.error; want.forEach(f => { S.descBusy.delete(f); S.descFailed.add(f); }); cvTools(); return; }
+      const q = new Set(res.queued || []);
+      S.descRound.total += q.size;
+      const known = want.filter(f => !q.has(f));  // already described on the server: this page just hadn't loaded it
+      known.forEach(f => S.descBusy.delete(f));
+      markDescribing();
+      if (known.length) { await loadDescriptions(); known.forEach(f => { if (!S.desc.files[f]) S.descFailed.add(f); }); render(); } else cvTools();
+    })
+    .catch(() => { want.forEach(f => S.descBusy.delete(f)); cvTools(); });
+}
+let descTimer = null;
+let roundTimer = null;
+function onDescribed(msg) {
+  if (S.descBusy.delete(msg.file)) S.descRound.done++;
+  if (!S.descBusy.size) {  // round over: say so for a moment, then clear the pill
+    clearTimeout(roundTimer);
+    roundTimer = setTimeout(() => { S.descRound = { total: 0, done: 0 }; if ($('vp')) cvTools(); }, 2500);
+  }
+  if (msg.error) { S.descErr = msg.error; S.descFailed.add(msg.file); cvTools(); return; }
+  Object.assign(S.desc.fns, msg.fns || {}); Object.assign(S.desc.files, msg.files || {});
+  // the boxes of this file flash once as they switch to plain English
+  S.justNamed.add(msg.file);
+  setTimeout(() => S.justNamed.delete(msg.file), 1400);
+  cvTools();
+  clearTimeout(descTimer);
+  descTimer = setTimeout(render, 200);  // several files land close together: draw once
+}
+// a flow's steps named in plain words; steps are cut by layer on the server, so each lists its real functions
+function flowSection(chain) {
+  if (!S.ui.simple || chain.length < 2) return '';
+  const ids = chain.map(st => st.id), key = ids.join('>');
+  const f = S.flows.get(key);
+  if (!f) {
+    S.flows.set(key, { pending: true });
+    fetch('/api/flow', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ p: S.p, ids }) })
+      .then(r => r.json()).then(res => { S.flows.set(key, res); render(); })
+      .catch(() => { S.flows.set(key, { error: 'Could not reach the Wiretap server.' }); render(); });
+    return `<div><h3>In plain words <span class="pill ai">AI</span></h3><p class="muted">Naming this flow…</p></div>`;
+  }
+  if (f.pending) return `<div><h3>In plain words <span class="pill ai">AI</span></h3><p class="muted">Naming this flow…</p></div>`;
+  if (f.error) return `<div><h3>In plain words</h3><p class="muted">Couldn't name this flow: ${esc(f.error)}</p></div>`;
+  const LAYER = { start: 'Where it starts', ...Object.fromEntries(S.g.lanes.map(l => [l.id, l.label])) };
+  return `<div><h3>In plain words <span class="pill ai">AI</span></h3>${f.title ? `<p class="flow-title">${esc(f.title)}</p>` : ''}
+    <ol class="flow">${f.steps.map(st => `<li><b>${esc(st.name)}</b><span class="r">${esc(LAYER[st.layer] || st.layer)} · ${esc(st.ids.map(i => i.startsWith('tg:') ? startLabel(i).filter(Boolean).join(' on ') : labelOf(i, true)).join(' → '))}</span></li>`).join('')}</ol></div>`;
 }
 function laneOf(id) {
   const k = kindOf(id);
@@ -156,7 +258,8 @@ window.addEventListener('hashchange', async () => {
 // ======================= layout + drawing =======================
 
 function layout(ids, edges, opts = {}) {
-  const laneOrder = S.g.lanes.map(l => l.id);
+  const laneDefs = opts.lanes || S.g.lanes;  // columns: the graph's roles unless a view brings its own
+  const laneOrder = laneDefs.map(l => l.id);
   const byLane = new Map();
   for (const id of ids) { const l = opts.lane ? opts.lane(id) : laneOf(id); if (!byLane.has(l)) byLane.set(l, []); byLane.get(l).push(id); }
   const lanes = laneOrder.filter(l => byLane.has(l));
@@ -181,10 +284,10 @@ function layout(ids, edges, opts = {}) {
     const arr = byLane.get(l), off = (maxRows - arr.length) * RH / 2;
     arr.forEach((id, i) => pos.set(id, { x: 16 + li * LW, y: TOP + off + i * RH }));
   });
-  return { pos, lanes: lanes.map((l, i) => ({ id: l, label: S.g.lanes.find(x => x.id === l).label, x: 16 + i * LW, members: byLane.get(l) })), W: 16 + lanes.length * LW, H: TOP + maxRows * RH + 20 };
+  return { pos, lanes: lanes.map((l, i) => ({ id: l, label: laneDefs.find(x => x.id === l).label, x: 16 + i * LW, members: byLane.get(l) })), W: 16 + lanes.length * LW, H: TOP + maxRows * RH + 20 };
 }
 
-const MARKERS = ['line', 'accent', 'up', 'down', 'ghost', 'warn'];
+const MARKERS = ['line', 'accent', 'up', 'down', 'ghost', 'warn', 'k-call', 'k-http', 'k-data', 'k-ui', 'k-out'];
 const defs = () => '<defs>' + MARKERS.map(c => `<marker id="ar-${c}" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L8,4 L0,8 z" style="fill:var(--${c})"/></marker>`).join('') + '</defs>';
 const markerFor = c => ({ hot: 'accent', up: 'up', down: 'down', ghost: 'ghost', new: 'down', warn: 'warn' }[c] || 'line');
 
@@ -215,6 +318,7 @@ function drawLanes(L, nodes, edges, opts = {}) {
     GEO.lanes.set(l.id, { members: (l.members || []).filter(id => nodes.some(n => n.id === id)), off: { ...off } });
     s += `<g class="lane" data-lane="${esc(l.id)}" transform="translate(${off.x},${off.y})"><title>Drag to move this column</title><rect class="lane-bg" x="${l.x - 8}" y="8" width="${NW + 16}" height="${L.H - 16}" rx="8"/><text class="lane-t" x="${l.x}" y="30">${esc(l.label)}</text></g>`;
   }
+  s += opts.under || '';
   const labels = [];
   for (const e of edges) {
     const A = L.pos.get(e.a), B = L.pos.get(e.b);
@@ -229,7 +333,7 @@ function drawLanes(L, nodes, edges, opts = {}) {
   for (const n of nodes) {
     const p = L.pos.get(n.id); if (!p) continue;
     const title = n.title ?? labelOf(n.id), sub = n.sub ?? subOf(n.id);
-    s += `<g class="node ${n.cls || ''}" tabindex="0" role="button" data-id="${esc(n.id)}" transform="translate(${p.x},${p.y})">
+    s += `<g class="node ${n.cls || ''}${descCls(n.id)}" tabindex="0" role="button" data-id="${esc(n.id)}" transform="translate(${p.x},${p.y})">
       <title>${esc(n.tip || pathOf(n.id))}</title>
       <rect class="box" width="${NW}" height="${NH}" rx="7"/>
       <rect class="stripe" x="0" y="8" width="3" height="${NH - 16}" rx="1.5" style="fill:${n.stripe || appColor(n.id)}"/>
@@ -240,6 +344,168 @@ function drawLanes(L, nodes, edges, opts = {}) {
   }
   return s;
 }
+
+// ======================= layered layout (ELK) =======================
+// Columns come from the links themselves, so a caller always sits left of what it calls, and ELK keeps lines from
+// crossing and draws them at right angles (docs/decisions/0007-layered-layout.md). Map and Folders use it; if the
+// layout script didn't load, they fall back to the lanes above.
+const FW = 236, FH = 50, FH_SIMPLE = 86;
+let ELKI = null, drawTok = 0;
+const elkCache = new Map();
+function elkReady() {
+  if (!ELKI && window.ELK) { try { ELKI = new window.ELK({ workerUrl: '/web/vendor/elk/elk-worker.min.js' }); } catch (e) { console.error(e); } }
+  return ELKI;
+}
+// edges: [{a, b}], each pair once. opts.part(id): the band a box must sit in, 0 leftmost (Uses it · In focus · It reaches)
+async function placeFlow(ids, edges, opts = {}) {
+  const h = opts.h || FH, have = new Set(ids);
+  edges = edges.filter(e => have.has(e.a) && have.has(e.b) && e.a !== e.b);
+  const key = JSON.stringify([ids, edges.map(e => e.a + '>' + e.b), h, opts.part ? ids.map(opts.part) : 0]);
+  if (elkCache.has(key)) return elkCache.get(key);
+  const res = await elkReady().layout({
+    id: 'root',
+    layoutOptions: {
+      'elk.algorithm': 'layered', 'elk.direction': 'RIGHT', 'elk.edgeRouting': 'ORTHOGONAL',
+      'elk.layered.spacing.nodeNodeBetweenLayers': '96', 'elk.spacing.nodeNode': '22',
+      'elk.spacing.edgeEdge': '8', 'elk.layered.spacing.edgeEdgeBetweenLayers': '8', 'elk.layered.spacing.edgeNodeBetweenLayers': '20',
+      'elk.layered.nodePlacement.strategy': 'NETWORK_SIMPLEX', 'elk.layered.considerModelOrder.strategy': 'NODES_AND_EDGES',
+      'elk.layered.thoroughness': '10', 'elk.partitioning.activate': opts.part ? 'true' : 'false',
+      'elk.padding': '[top=58,left=16,bottom=24,right=24]',
+    },
+    children: ids.map(id => ({ id, width: FW, height: h, ...(opts.part ? { layoutOptions: { 'elk.partitioning.partition': String(opts.part(id)) } } : {}) })),
+    edges: edges.map((e, i) => ({ id: 'e' + i, sources: [e.a], targets: [e.b] })),
+  });
+  const routes = new Map();
+  (res.edges || []).forEach((e, i) => { const s = e.sections?.[0]; if (s) routes.set(edges[i].a + '>' + edges[i].b, [s.startPoint, ...(s.bendPoints || []), s.endPoint]); });
+  const out = { pos: new Map(res.children.map(c => [c.id, { x: c.x, y: c.y }])), routes, w: FW, h };
+  if (elkCache.size > 30) elkCache.delete(elkCache.keys().next().value);
+  elkCache.set(key, out);
+  return out;
+}
+function roundedPath(pts, r = 10) {
+  let d = `M${pts[0].x},${pts[0].y}`;
+  for (let i = 1; i < pts.length - 1; i++) {
+    const a = pts[i - 1], b = pts[i], c = pts[i + 1];
+    const d1 = Math.hypot(b.x - a.x, b.y - a.y), d2 = Math.hypot(c.x - b.x, c.y - b.y), rr = Math.min(r, d1 / 2, d2 / 2);
+    if (!rr) { d += `L${b.x},${b.y}`; continue; }
+    const p1 = { x: b.x + (a.x - b.x) * rr / d1, y: b.y + (a.y - b.y) * rr / d1 }, p2 = { x: b.x + (c.x - b.x) * rr / d2, y: b.y + (c.y - b.y) * rr / d2 };
+    d += `L${p1.x.toFixed(1)},${p1.y.toFixed(1)}Q${b.x},${b.y} ${p2.x.toFixed(1)},${p2.y.toFixed(1)}`;
+  }
+  const z = pts[pts.length - 1];
+  return d + `L${z.x},${z.y}`;
+}
+// the last point pulled back a little, so the arrowhead ends on the box's edge
+function trimEnd(pts, by = 3) {
+  const a = pts[pts.length - 2], z = pts[pts.length - 1], len = Math.hypot(z.x - a.x, z.y - a.y) || 1;
+  return [...pts.slice(0, -1), { x: z.x - (z.x - a.x) * by / len, y: z.y - (z.y - a.y) * by / len }];
+}
+// a right-angled line for a box dragged off ELK's route: across if B is to the right, else around underneath
+function ortho(A, B, w, h) {
+  const sx = A.x + w, sy = A.y + h / 2, ex = B.x - 3, ey = B.y + h / 2;
+  const pts = ex - sx > 24
+    ? [{ x: sx, y: sy }, { x: (sx + ex) / 2, y: sy }, { x: (sx + ex) / 2, y: ey }, { x: ex, y: ey }]
+    : (yb => [{ x: sx, y: sy }, { x: sx + 16, y: sy }, { x: sx + 16, y: yb }, { x: ex - 16, y: yb }, { x: ex - 16, y: ey }, { x: ex, y: ey }])(Math.max(A.y, B.y) + h + 14);
+  return { pts, d: roundedPath(pts) };
+}
+function wrap(t, n, max) {
+  const out = [];
+  for (const w of String(t || '').split(/\s+/).filter(Boolean)) {
+    const last = out[out.length - 1];
+    if (last !== undefined && (last + ' ' + w).length <= n) out[out.length - 1] = last + ' ' + w; else out.push(w);
+  }
+  const keep = out.slice(0, max);
+  if (out.length > max) keep[max - 1] = out.slice(max - 1).join(' ');
+  return keep.map(l => trunc(l, n));
+}
+// the colour of a line: what it carries
+function kindCls(r) {
+  const k = r?.kinds || {};
+  return k.http ? 'k-http' : k.read || k.write || k.db ? 'k-data' : k.renders ? 'k-ui' : k.ext || k.res ? 'k-out' : 'k-call';
+}
+function linkTip(a, b, r) {
+  const words = r ? edgeWords(r) : '';
+  return [`${labelOf(a)} → ${labelOf(b)}`, [words || 'uses', r && plural(r.n, 'link')].filter(Boolean).join(' · '),
+    ...(r?.labels || []).filter(l => !words.includes(l)).slice(0, 4), 'Click to see the calls behind it'].join('\n');
+}
+// lay out, then draw; other views drawn meanwhile win (render bumps drawTok)
+function mountFlow(ids, nodes, edges, opts, after) {
+  const tok = ++drawTok;
+  placeFlow(ids, edges, opts).then(P => {
+    if (tok !== drawTok) return;
+    mountSvg(drawFlow(P, nodes, edges, opts));
+    after?.();
+    describeOnScreen();
+  }).catch(err => {
+    console.error(err);
+    if (tok === drawTok) showEmpty(`<h2>Layout failed</h2><p>${esc(err.message || err)}</p><p>Pick <b>Columns: by role</b> above to draw it the old way.</p>`);
+  });
+}
+// nodes: [{id, cls, title, sub, desc, meta, self, tip, stripe, badge, badgeColor}]; self: the file a box stands for, when
+// its id is something else (a folder's outside link). edges: [{a, b, kind, n, tip, faint, hit}].
+// opts.bands: [{label, ids}] brackets over the columns.
+function drawFlow(P, nodes, edges, opts = {}) {
+  const vk = viewKey(), w = P.w, h = P.h, tall = h > FH;
+  const pos = new Map([...P.pos].map(([id, p]) => [id, { ...p }]));  // the cached layout stays as ELK left it
+  const moved = new Set();
+  for (const [id, p] of pos) { const m = S.moved.get(vk + '|' + id); if (m) { p.x = m.x; p.y = m.y; moved.add(id); } }
+  GEO = { pos, w, h, lanes: new Map(), ortho: true };
+  let s = defs() + '<g class="flowg">';
+  const top = Math.min(...[...pos.values()].map(p => p.y)) - 26;
+  for (const b of opts.bands || []) {
+    const ps = b.ids.map(id => pos.get(id)).filter(Boolean);
+    if (!ps.length) continue;
+    const x0 = Math.min(...ps.map(p => p.x)), x1 = Math.max(...ps.map(p => p.x)) + w, cx = (x0 + x1) / 2;
+    const half = Math.min(b.label.length * 4.4 + 10, (x1 - x0) / 2 - 8);
+    // ⌐—— label ——¬ : the ends curl down toward the boxes
+    s += `<g class="band"><path d="M${x0},${top + 9} v-5 q0,-4 4,-4 H${cx - half} M${cx + half},${top} H${x1 - 4} q4,0 4,4 v5"/><text x="${cx}" y="${top}" text-anchor="middle">${esc(trunc(b.label, 40))}</text></g>`;
+  }
+  for (const e of edges) {
+    const A = pos.get(e.a), B = pos.get(e.b);
+    if (!A || !B) continue;
+    const route = !moved.has(e.a) && !moved.has(e.b) && P.routes.get(e.a + '>' + e.b);
+    const pts = route ? trimEnd(route) : ortho(A, B, w, h).pts;
+    const d = route ? roundedPath(pts) : ortho(A, B, w, h).d;
+    const ends = `data-ea="${esc(e.a)}" data-eb="${esc(e.b)}"`, kind = e.kind || 'k-call';
+    const sw = (1.3 + Math.min(4, Math.log2((e.n || 1) + 1)) * 0.55).toFixed(2);  // thicker when it stands for more links
+    if (e.hit) s += `<path class="hit" ${ends} d="${d}" data-a="${esc(e.hit[0])}" data-b="${esc(e.hit[1])}" data-tip="${esc(e.tip || '')}"/>`;
+    s += `<path class="edge ${kind}${e.faint ? ' faint' : ''}" ${ends} d="${d}" style="--sw:${sw}px" marker-end="url(#ar-${kind})"/>`;
+    s += `<circle class="port ${kind}" ${ends} cx="${pts[0].x}" cy="${pts[0].y}" r="3"/>`;
+  }
+  for (const n of nodes) {
+    const p = pos.get(n.id);
+    if (!p) continue;
+    const title = n.title ?? labelOf(n.id), sub = n.sub ?? subOf(n.id), meta = n.meta || '';
+    const desc = tall ? wrap(n.desc, 34, 2) : [];
+    const big = wrap(title, 15, tall ? 3 : 2), by = (h - big.length * 25) / 2 + 18;  // the title alone, read from far out
+    s += `<g class="node fc ${n.cls || ''}${descCls(n.self || n.id)}" tabindex="0" role="button" data-id="${esc(n.id)}"${n.self ? ` data-self="${esc(n.self)}"` : ''} transform="translate(${p.x},${p.y})">
+      <title>${esc(n.tip ?? pathOf(n.id))}</title>
+      <rect class="box" width="${w}" height="${h}" rx="8"/>
+      <rect class="stripe" x="0" y="8" width="3" height="${h - 16}" rx="1.5" style="fill:${n.stripe || appColor(n.self || n.id)}"/>
+      <g class="near"><text class="t" x="12" y="21">${esc(trunc(title, 30))}</text>
+      ${desc.map((l, i) => `<text class="d d${i + 1}" x="12" y="${38 + i * 14}">${esc(l)}</text>`).join('')}
+      <text class="s" x="12" y="${h - 12}">${esc(trunc(sub, meta ? 34 - meta.length : 36))}</text>
+      ${meta ? `<text class="m" x="${w - 10}" y="${h - 12}" text-anchor="end">${esc(meta)}</text>` : ''}</g>
+      <text class="tl">${big.map((l, i) => `<tspan x="12" y="${by + i * 25}">${esc(l)}</tspan>`).join('')}</text>
+      ${n.badge ? `<circle r="10" cx="${w - 4}" cy="4" style="fill:${n.badgeColor || 'var(--accent)'}"/><text class="badge-t" x="${w - 4}" y="8" text-anchor="middle">${esc(n.badge)}</text>` : ''}
+    </g>`;
+  }
+  return s + '</g>';
+}
+
+// ---------- tooltips for lines ----------
+function showTip(ev, text) {
+  if (!text || document.querySelector('.scroll.dragging')) return;
+  const lines = text.split('\n');
+  $('tip').innerHTML = `<b>${esc(lines[0])}</b>` + lines.slice(1).map(l => `<div class="${l.startsWith('Click') ? 'h' : ''}">${esc(l)}</div>`).join('');
+  $('tip').hidden = false; moveTip(ev);
+}
+function moveTip(ev) {
+  const t = $('tip'); if (t.hidden) return;
+  const x = ev.clientX + 16, y = ev.clientY + 16;
+  t.style.left = Math.max(8, x + t.offsetWidth > innerWidth - 8 ? ev.clientX - t.offsetWidth - 12 : x) + 'px';
+  t.style.top = Math.max(8, y + t.offsetHeight > innerHeight - 8 ? ev.clientY - t.offsetHeight - 12 : y) + 'px';
+}
+function hideTip() { $('tip').hidden = true; }
 
 // ======================= canvas: pan, zoom, drag boxes =======================
 // The drawing sits in one <g id="vp">; panning and zooming change only its transform, so nothing is redrawn.
@@ -252,6 +518,7 @@ function mountSvg(svgStr) {
   svg.removeAttribute('viewBox');
   svg.setAttribute('width', '100%'); svg.setAttribute('height', '100%');
   svg.innerHTML = `<g id="vp">${svgStr}</g>`;
+  svg.classList.remove('hovering');
   svg.style.display = ''; $('empty').innerHTML = '';
   $('scroll').classList.toggle('can-drag', !!GEO);
   // a new view starts fitted; a live update of the same view keeps where you panned and zoomed
@@ -261,6 +528,9 @@ function mountSvg(svgStr) {
 }
 function applyVP() {
   $('vp')?.setAttribute('transform', `translate(${VP.x},${VP.y}) scale(${VP.k})`);
+  // zoomed out, boxes show only a big title; a little closer, they drop the second line of description
+  $('svg').classList.toggle('lod-low', VP.k < 0.5);
+  $('svg').classList.toggle('lod-mid', VP.k >= 0.5 && VP.k < 0.75);
   if ($('zk')) $('zk').textContent = Math.round(VP.k * 100) + '%';
 }
 // all: fit the whole drawing (the Fit button). Otherwise fit the width only, so a tall view stays readable and scrolls.
@@ -282,6 +552,10 @@ function cvTools() {
   $('cvtools').innerHTML = `<button data-a="side" title="Show or hide the project list ( [ )" aria-pressed="${S.ui.side}">${icon('side')}</button>
     <span class="grp"><button data-a="out" title="Zoom out">−</button><span id="zk">${Math.round(VP.k * 100)}%</span><button data-a="in" title="Zoom in">+</button></span>
     <button data-a="fit" title="Fit to screen ( F )">Fit</button>
+    ${!S.ui.simple ? '' : S.descBusy.size ? `<span class="desc-st busy" role="status" title="Claude (haiku) is writing plain-English names for the files on screen"><i class="spin"></i>✦ Writing plain names · ${Math.min(S.descRound.done, S.descRound.total)} of ${Math.max(S.descRound.total, S.descBusy.size)}</span>`
+      : S.descErr ? `<span class="desc-st err" role="status" title="${esc(S.descErr)}">Couldn't describe some files</span>`
+      : S.descRound.total ? `<span class="desc-st done" role="status">✦ ${plural(S.descRound.done, 'file')} named</span>` : ''}
+    <span class="grp seg" title="Simple: plain-English names written by Claude (claude -p, haiku), cached until the code changes. Raw: the code's own names. ( S )"><button data-a="raw" aria-pressed="${!S.ui.simple}">Raw</button><button data-a="simple" aria-pressed="${!!S.ui.simple}">✦ Simple</button></span>
     ${moved ? '<button data-a="reset" title="Put moved boxes back">Reset layout</button>' : ''}
     <button data-a="focus" title="Hide both side panels">${S.ui.side || S.ui.panel ? 'Focus' : 'Exit focus'}</button>
     <button data-a="panel" title="Show or hide the side panel ( ] )" aria-pressed="${S.ui.panel}">${icon('panel')}</button>`;
@@ -291,6 +565,7 @@ $('cvtools').addEventListener('click', e => {
   const r = $('scroll').getBoundingClientRect();
   if (a === 'in' || a === 'out') zoomAt(a === 'in' ? 1.2 : 1 / 1.2, r.width / 2, r.height / 2);
   else if (a === 'fit') fitView(true);
+  else if ((a === 'simple') !== !!S.ui.simple && (a === 'simple' || a === 'raw')) toggleSimple();
   else if (a === 'reset') { for (const k of [...S.moved.keys()]) if (k.startsWith(VP.key + '|')) S.moved.delete(k); render(); }
   else if (a === 'side' || a === 'panel') setUI({ [a]: !S.ui[a] });
   else if (a === 'focus') { const on = S.ui.side || S.ui.panel; setUI({ side: !on, panel: !on }); }
@@ -412,6 +687,11 @@ function moveBoxes(ids, dx, dy) {
   svg.querySelectorAll('[data-ea]').forEach(el => {
     const a = el.dataset.ea, b = el.dataset.eb;
     if (!set.has(a) && !set.has(b)) return;
+    if (GEO.ortho) {  // a line drawn by ELK: redrawn at right angles from the box's new place
+      const o = ortho(GEO.pos.get(a), GEO.pos.get(b), GEO.w, GEO.h);
+      if (el.tagName === 'path') el.setAttribute('d', o.d); else { el.setAttribute('cx', o.pts[0].x); el.setAttribute('cy', o.pts[0].y); }
+      return;
+    }
     const c = curve(GEO.pos.get(a), GEO.pos.get(b), GEO.w, GEO.h);
     if (el.tagName === 'path') el.setAttribute('d', c.d);
     else el.setAttribute('transform', `translate(${c.mx - el.dataset.w / 2},${c.my - 9})`);
@@ -432,8 +712,26 @@ function wireNodes(onClick, onDbl) {
   });
   $('svg').querySelectorAll('.hit').forEach(el => {
     el.addEventListener('click', () => { if (!S.justDragged) go({ v: 'link', a: el.dataset.a, b: el.dataset.b }); });
-    el.addEventListener('mouseenter', () => el.nextElementSibling?.classList.add('hov'));
-    el.addEventListener('mouseleave', () => el.nextElementSibling?.classList.remove('hov'));
+    el.addEventListener('mouseenter', ev => { el.nextElementSibling?.classList.add('hov'); showTip(ev, el.dataset.tip); });
+    el.addEventListener('mousemove', moveTip);
+    el.addEventListener('mouseleave', () => { el.nextElementSibling?.classList.remove('hov'); hideTip(); });
+  });
+  // drawn by drawFlow: hovering a box fades everything it isn't linked to
+  const svg = $('svg'), fg = svg.querySelector('.flowg');
+  if (!fg) return;
+  fg.querySelectorAll('.node').forEach(el => {
+    el.addEventListener('mouseenter', () => {
+      if (document.querySelector('.scroll.dragging')) return;
+      const id = el.dataset.id, keep = new Set([id]);
+      fg.querySelectorAll('[data-ea]').forEach(x => {
+        const on = x.dataset.ea === id || x.dataset.eb === id;
+        x.classList.toggle('hl', on);
+        if (on) { keep.add(x.dataset.ea); keep.add(x.dataset.eb); }
+      });
+      fg.querySelectorAll('.node').forEach(n => n.classList.toggle('hl', keep.has(n.dataset.id)));
+      svg.classList.add('hovering');
+    });
+    el.addEventListener('mouseleave', () => { svg.classList.remove('hovering'); fg.querySelectorAll('.hl').forEach(x => x.classList.remove('hl')); });
   });
 }
 
@@ -490,14 +788,14 @@ function changedFnSet(task) {
 
 function render() {
   if (!S.g) return;
-  document.querySelectorAll('#views button').forEach(b => b.setAttribute('aria-pressed', b.dataset.v === (['file', 'link'].includes(S.r.v) ? 'map' : S.r.v)));
+  document.querySelectorAll('#views button').forEach(b => b.setAttribute('aria-pressed', b.dataset.v === (['file', 'link'].includes(S.r.v) ? 'map' : S.r.v === 'tree' ? 'system' : S.r.v)));
   $('live-tab').querySelector('.dot')?.remove();
   if (S.liveDot && S.r.v !== 'live') $('live-tab').insertAdjacentHTML('beforeend', '<span class="dot"></span>');
   if (S.r.v === 'live') S.liveDot = false;
-  tools(''); chips([]); $('stepper').hidden = true; S.stepNav = null; GEO = null;
+  tools(''); chips([]); $('stepper').hidden = true; S.stepNav = null; GEO = null; drawTok++; hideTip();
   renderSide();
-  const v = { system: viewSystem, map: viewMap, file: viewFile, link: viewLink, live: viewLive, trace: viewTrace, resources: viewResources }[S.r.v] || viewSystem;
-  try { v(); foldable(); } catch (err) {
+  const v = { system: viewSystem, tree: viewTree, map: viewMap, file: viewFile, link: viewLink, live: viewLive, trace: viewTrace, resources: viewResources }[S.r.v] || viewSystem;
+  try { v(); foldable(); describeOnScreen(); } catch (err) {
     console.error(err);
     $('panel').innerHTML = `<div class="callout"><b>This view hit a bug</b>${esc(err.message)}</div>`;
   }
@@ -615,14 +913,14 @@ function viewSystem() {
     s += `<g class="node ${cls}" tabindex="0" role="button" data-id="${esc(n.id)}" transform="translate(${p.x},${p.y})"><rect class="box" width="${NW}" height="${NH}" rx="7"/><rect class="stripe" x="0" y="8" width="3" height="${NH - 16}" style="fill:${stripe}"/><text class="t" x="12" y="21">${esc(trunc(n.title, 27))}</text><text class="s" x="12" y="37">${esc(n.sub)}</text></g>`;
   }
   mountSvg(s, W, H);
-  wireNodes(id => go({ v: 'system', id: S.r.id === id ? undefined : id }), id => go({ v: 'map', id }));
+  wireNodes(id => go({ v: 'system', id: S.r.id === id ? undefined : id }), id => go(id.startsWith('app:') ? { v: 'tree', id: treeId(id.slice(4), '') } : { v: 'map', id }));
   crumbs([['System']]);
   chips([['green', 'file', plural(g.stats.files, 'file')], ['amber', 'fn', plural(g.stats.functions, 'function')], ['lilac', 'link', plural(g.stats.edges, 'link')]]);
   const st = g.stats;
   const httpN = g.edges.filter(e => e.k === 'http').length, missing = g.nodes.filter(n => n.kind === 'route' && n.missing).length;
   $('readout').innerHTML = `<b>${esc(g.name)}</b>: ${plural(g.apps.length, 'app')}, ${st.files} files, ${st.functions} functions.
     <span class="k-acc">${httpN} API calls</span> from the apps reach their backends${missing ? `; <span class="k-warn">${missing} call${missing === 1 ? '' : 's'} hit no backend route</span>` : ''}.
-    <small>Click a box to see what it talks to, then pick a file from the list on the right. Double-click opens it on the map. Press / to search.</small>`;
+    <small>Click a box to see what it talks to. Double-click an app to go into its folders, anything else to open it on the map. Press / to search.</small>`;
   legend([['var(--accent)', 'Selected and what it talks to'], [null, 'Numbers on lines count links in the code']]);
   // panel
   const P = $('panel');
@@ -636,7 +934,8 @@ function viewSystem() {
     const files = g.files.filter(f => f.app === aid).sort((x, y) => I.degree(y.id) - I.degree(x.id));
     const routes = g.nodes.filter(n => n.kind === 'route' && n.app === aid && !n.missing).length;
     P.innerHTML = `<div><h2>${esc(a.name)}</h2><div class="path">${esc(a.root)}</div></div>
-      <p>Click a file below to open it on the map.</p>
+      <button class="btn" data-go="${esc(JSON.stringify({ v: 'tree', id: treeId(aid, '') }))}">Go into its folders →</button>
+      <p>Or click a file below to open it on the map.</p>
       <div class="stats"><div class="stat acc"><b>${files.length}</b><span>files</span></div><div class="stat acc"><b>${g.fns.filter(f => f.file.startsWith('f:' + aid + ':')).length}</b><span>functions</span></div><div class="stat"><b>${routes}</b><span>API routes</span></div></div>
       <div><h3>Most connected files</h3><ul class="list">${files.slice(0, 40).map(f => item(['acc', I.degree(f.id)], esc(f.label), null, f.rel, goAttr({ v: 'map', id: f.id }))).join('')}</ul></div>`;
   } else if (sel.startsWith('db:')) {
@@ -655,7 +954,16 @@ function diagnostics() {
   const g = S.g;
   const um = g.unmatched_http || [];
   const unr = g.unresolved || [];
-  return `<div><h3>How complete the map is</h3><ul class="list">
+  // what each adapter found per app, and what nothing reads (other languages, libraries without an adapter)
+  const cov = g.coverage || { apps: [], not_parsed: [], not_read: [] };
+  const KIND = { routes: 'route', tables: 'table', http: 'HTTP call', jobs: 'job' };
+  const understood = cov.apps.map(a => {
+    const parts = Object.entries(KIND).filter(([k]) => a.found[k]).map(([k, w]) => `${plural(Object.values(a.found[k]).reduce((x, y) => x + y, 0), w)} (${Object.keys(a.found[k]).sort().join(', ')})`);
+    const h = a.http.calls ? `${a.http.matched} of ${a.http.calls} HTTP calls matched a route` : '';
+    return item(['acc', a.lang], esc(a.name), esc([parts.join(' · ') || 'No routes, tables or HTTP calls found', h].filter(Boolean).join('. ')), null, goAttr({ v: 'system', id: 'app:' + a.id }));
+  }).join('') + cov.not_parsed.map(o => item(['risk', 'skipped'], `${plural(o.files, o.lang + ' file')} not parsed`, 'Wiretap reads Python and TypeScript/JavaScript.')).join('')
+    + cov.not_read.map(n => item(['risk', 'not read'], esc(n.what), `${esc(n.dep)} in ${esc(appName(n.app))}: no adapter reads it yet, so these don't appear on the map. docs/adapters.md shows how to add one.`)).join('');
+  return `<div><h3>What Wiretap understood</h3><ul class="list">${understood}</ul></div><div><h3>How complete the map is</h3><ul class="list">
     ${item([um.length ? 'risk' : 'down', um.length ? um.length : 'ok'], 'API calls with no matching route', um.length ? 'Usually an old endpoint or a URL built at runtime.' : 'Every API call in the apps matched a backend route.')}
     ${item(['new', g.stats.unresolved_calls || 0], 'Calls the map could not follow', unr.slice(0, 4).map(([n, c]) => `${esc(n)} ×${c}`).join(' · '))}
   </ul></div>${um.length ? `<div><h3>Unmatched API calls</h3><ul class="list">${um.slice(0, 30).map(u => item(['risk', 'call'], esc(u.call), null, `${appName(u.app)} · ${u.file}:${u.line}`, goAttr({ v: 'file', id: `f:${u.app}:${u.file}` }))).join('')}</ul></div>` : ''}`;
@@ -677,6 +985,21 @@ function bfs(start, dir, depth, cap) {
   }
   dist.delete(start);
   return { dist, more };
+}
+
+const LINE_LEGEND = [['var(--k-call)', 'Calls'], ['var(--k-http)', 'API calls'], ['var(--k-data)', 'Reads or writes data'], ['var(--k-ui)', 'Renders'], ['var(--k-out)', 'Outside service']];
+// a box's second line in Simple mode: the model's sentence, or a note that it's being written
+function plainLine(id) {
+  if (!S.ui.simple) return '';
+  const d = descOf(id);
+  if (d?.t) return d.t;
+  return descCls(id).includes('describing') ? '✦ writing a plain name…' : '';
+}
+function metaOf(id) {
+  const k = kindOf(id);
+  if (k === 'file') { const n = S.I.fnsByFile.get(id)?.length || 0; return n ? plural(n, 'fn', 'fns') : ''; }
+  if (k === 'fn') return 'L' + (S.I.fns.get(id)?.line ?? '');
+  return '';
 }
 
 function viewMap() {
@@ -707,7 +1030,11 @@ function viewMap() {
   const ids = new Set([id, ...up.dist.keys(), ...down.dist.keys()]);
   const edges = [];
   const seen = new Set();
-  const addE = (a, b, cls, label) => { const k = a + '>' + b; if (seen.has(k)) return; seen.add(k); edges.push({ a, b, cls, label, hit: [a, b] }); };
+  const addE = (a, b, cls, label) => {
+    const k = a + '>' + b; if (seen.has(k)) return; seen.add(k);
+    const r = I.fout.get(a)?.get(b);
+    edges.push({ a, b, cls, label, hit: [a, b], kind: kindCls(r), n: r?.n, tip: linkTip(a, b, r), faint: cls === 'faint' });
+  };
   for (const [u, du] of up.dist) for (const [v, r] of (I.fout.get(u) || new Map())) {
     const dv = v === id ? 0 : up.dist.get(v);
     if (dv !== undefined && dv === du - 1) addE(u, v, 'up', v === id ? edgeWords(r) : null);
@@ -717,29 +1044,44 @@ function viewMap() {
     for (const [v, r] of (I.fout.get(u) || new Map())) if (down.dist.get(v) === du + 1) addE(u, v, 'down', u === id ? edgeWords(r) : null);
   }
   if (all) for (const u of ids) for (const [v] of (I.fout.get(u) || new Map())) if (ids.has(v)) addE(u, v, 'faint', null);
-  const L = layout([...ids], edges.map(e => [e.a, e.b]), { pin: x => x === id, rank: x => x === id ? -1 : (up.dist.get(x) ?? down.dist.get(x) ?? 0) });
+  // By calls (the default): ELK puts who uses it on the left and what it reaches on the right, in as many columns as
+  // the chain needs. By role: the older fixed lanes (screens, routes, logic, data), which suit a frontend → backend hop.
+  const cols = S.r.cols === 'role' || !elkReady() ? 'role' : 'flow';
   const live = liveClasses();
-  const nodes = [...ids].map(n => ({ id: n, cls: (n === id ? 'focus' : up.dist.has(n) ? 'up' : 'down') + (I.nodes.get(n)?.missing ? ' missing' : '') + (live.cls.get(n) ? ' ' + live.cls.get(n) : ''), badge: live.badge.get(n), badgeColor: live.badgeColor.get(n) }));
-  mountSvg(drawLanes(L, nodes, edges), L.W, L.H);
-  wireNodes(n => {
+  const nodes = [...ids].map(n => ({ id: n, cls: (n === id ? 'focus' : up.dist.has(n) ? 'up' : 'down') + (I.nodes.get(n)?.missing ? ' missing' : '') + (live.cls.get(n) ? ' ' + live.cls.get(n) : ''),
+    badge: live.badge.get(n), badgeColor: live.badgeColor.get(n), desc: plainLine(n), meta: metaOf(n) }));
+  const wire = () => wireNodes(n => {
     if (n === id) { if (kindOf(n) === 'file') go({ v: 'file', id: n }); return; }
-    go({ v: 'map', id: n, d: S.r.d, all: S.r.all });
+    go({ v: 'map', id: n, d: S.r.d, all: S.r.all, cols: S.r.cols });
   });
+  if (cols === 'flow') {
+    const part = x => x === id ? 1 : up.dist.has(x) ? 0 : 2;
+    const bands = [['Uses it', 0], ['In focus', 1], ['It reaches', 2]].map(([label, k]) => ({ label, ids: [...ids].filter(x => part(x) === k) }));
+    mountFlow([...ids], nodes, edges, { h: S.ui.simple ? FH_SIMPLE : FH, part, bands }, wire);
+  } else {
+    const L = layout([...ids], edges.map(e => [e.a, e.b]), { pin: x => x === id, rank: x => x === id ? -1 : (up.dist.get(x) ?? down.dist.get(x) ?? 0) });
+    mountSvg(drawLanes(L, nodes, edges), L.W, L.H);
+    wire();
+  }
   tools(`<label>Depth <select id="depth">${[1, 2, 3].map(d => `<option ${d === depth ? 'selected' : ''}>${d}</option>`).join('')}</select></label>
+    <label>Columns <select id="cols"><option value="flow" ${cols === 'flow' ? 'selected' : ''}>by calls</option><option value="role" ${cols === 'role' ? 'selected' : ''}>by role</option></select></label>
     <label><input type="checkbox" id="allx" ${all ? 'checked' : ''}> Show links between the others too</label>
-    <span>Click a box to move there. Click the focused box again to look inside. Click a line to see the calls behind it.</span>`);
+    <span>Click a box to move there. Click the focused box again to look inside. Hover a line to see what it carries; click it for the calls behind it.</span>`);
   $('depth').onchange = e => go({ ...S.r, id: S.r.id, d: +e.target.value });
   $('allx').onchange = e => go({ ...S.r, all: e.target.checked ? '1' : '' });
+  $('cols').onchange = e => go({ ...S.r, cols: e.target.value === 'flow' ? '' : e.target.value });
 
   const dUp = [...(I.fin.get(id) || new Map()).entries()].sort((a, b) => b[1].n - a[1].n);
   const dDown = [...(I.fout.get(id) || new Map()).entries()].sort((a, b) => b[1].n - a[1].n);
   const upApps = [...new Set([...up.dist.keys()].map(appOf).filter(Boolean).map(appName))];
-  crumbs([['System', { v: 'system' }], [labelOf(id)]]);
+  const f = I.files.get(id);
+  crumbs([['System', { v: 'system' }], ...(f ? dirCrumbs(f.app, f.rel.split('/').slice(0, -1).join('/')) : []), [labelOf(id)]]);
   chips([appOf(id) && ['green', 'dot', appName(appOf(id))], ['amber', 'link', `${dUp.length} in`], ['teal', 'link', `${dDown.length} out`]]);
   const kind = kindOf(id);
   $('readout').innerHTML = `<b>${esc(labelOf(id))}</b> is used by <span class="k-up">${plural(dUp.length, 'file')}</span>${upApps.length ? ` across ${esc(list(upApps))}` : ''} and directly reaches <span class="k-down">${dDown.length}</span>.
     <small>${dUp.length ? `If you change it, recheck: ${esc(list(dUp.slice(0, 5).map(([n]) => labelOf(n))))}${dUp.length > 5 ? ` and ${dUp.length - 5} more` : ''}.` : 'Nothing calls into it from another file.'}${up.more.size || down.more.size ? ' Some boxes were left out to keep the map readable; the side panel lists everything.' : ''}</small>`;
-  legend([['var(--accent)', 'Focus'], ['var(--up)', 'Uses it'], ['var(--down)', 'It reaches'], ['var(--warn)', 'Missing backend route']]);
+  legend(cols === 'flow' ? LINE_LEGEND.concat([['var(--warn)', 'Missing backend route'], [null, 'Thicker lines stand for more links']])
+    : [['var(--accent)', 'Focus'], ['var(--up)', 'Uses it'], ['var(--down)', 'It reaches'], ['var(--warn)', 'Missing backend route']]);
 
   const P = $('panel');
   const n = I.nodes.get(id);
@@ -752,7 +1094,7 @@ function viewMap() {
       <div><h3>Functions that use it</h3><ul class="list">${users.slice(0, 80).map(e => item([e.k === 'write' ? 'up' : 'down', edgeWord(e)], esc(labelOf(e.s)), e.l && e.k !== 'res' ? esc(e.l) : null, pathOf(e.s), goAttr(openRoute(e.s)))).join('')}</ul></div>`;
     if (n.desc) extra = `<p>${esc(n.desc)}</p>` + extra;
   }
-  P.innerHTML = `<div><h2>${esc(labelOf(id))}</h2><div class="path">${esc(pathOf(id))}</div></div>${fileInfo}${extra}
+  P.innerHTML = `<div><h2>${esc(labelOf(id))}</h2><div class="path">${esc(pathOf(id))}</div>${aiNote(id)}</div>${fileInfo}${extra}
     <div><h3>Directly used by</h3>${dUp.length ? `<ul class="list">${dUp.slice(0, 60).map(([o, r]) => item(['up', edgeWords(r) || 'uses'], esc(labelOf(o)), null, pathOf(o), goAttr({ v: 'map', id: o, d: S.r.d }))).join('')}</ul>` : '<p>Nothing in another file calls it.</p>'}</div>
     <div><h3>Directly reaches</h3>${dDown.length ? `<ul class="list">${dDown.slice(0, 60).map(([o, r]) => item(['down', edgeWords(r) || 'uses'], esc(labelOf(o)), null, pathOf(o), goAttr({ v: 'map', id: o, d: S.r.d }))).join('')}</ul>` : '<p>It calls nothing in other files.</p>'}</div>`;
   if (kind === 'file') {
@@ -760,6 +1102,156 @@ function viewMap() {
     $('copy').onclick = () => copyText(absPath(id), $('copy'));
   }
   wireList(P);
+}
+
+// ---------- Folders: an app, then a folder, then the files in it, one level at a time ----------
+// Each level shows what's inside (its folders and files) in the middle, what uses it on the left and what it uses
+// on the right. Outside things are shown at the nearest level they share with it: a sibling folder, another app, a
+// database or an outside service. A folder holding only one folder is skipped through.
+const treeId = (app, dir) => `dir:${app}:${dir}`;
+function parseTree(id) {
+  const s = (id || '').slice(4), i = s.indexOf(':');
+  return id?.startsWith('dir:') && i > 0 ? { app: s.slice(0, i), dir: s.slice(i + 1) } : null;
+}
+function dirIndex(app) {
+  const I = S.I;
+  if (!I.dirs) I.dirs = new Map();
+  if (I.dirs.has(app)) return I.dirs.get(app);
+  const m = new Map();
+  const at = d => m.get(d) || m.set(d, { dirs: new Set(), files: [], n: 0 }).get(d);
+  for (const f of S.g.files) {
+    if (f.app !== app) continue;
+    const segs = f.rel.split('/');
+    for (let i = 0; i < segs.length; i++) {
+      const d = segs.slice(0, i).join('/');
+      at(d).n++;
+      if (i === segs.length - 1) at(d).files.push(f.id); else at(d).dirs.add(segs.slice(0, i + 1).join('/'));
+    }
+  }
+  I.dirs.set(app, m);
+  return m;
+}
+// through folders that hold nothing but one folder (src/app/…)
+function deepen(app, dir) {
+  const m = dirIndex(app);
+  for (let e = m.get(dir); e && !e.files.length && e.dirs.size === 1; e = m.get(dir)) dir = [...e.dirs][0];
+  return dir;
+}
+function dirCrumbs(app, dir) {
+  const parts = [[appName(app), { v: 'tree', id: treeId(app, '') }]];
+  const segs = dir ? dir.split('/') : [];
+  segs.forEach((seg, i) => parts.push([seg, { v: 'tree', id: treeId(app, segs.slice(0, i + 1).join('/')) }]));
+  return parts;
+}
+// what x shows up as from inside folder dir of app: {id, inside}
+function groupIn(app, dir, x) {
+  const I = S.I, k = kindOf(x);
+  if (k === 'file') {
+    const f = I.files.get(x);
+    if (!f) return null;
+    if (f.app !== app) return { id: 'app:' + f.app, inside: false };
+    const segs = f.rel.split('/'), d = dir ? dir.split('/') : [];
+    let i = 0;
+    while (i < d.length && i < segs.length - 1 && segs[i] === d[i]) i++;
+    return { id: i === segs.length - 1 ? x : treeId(app, deepen(app, segs.slice(0, i + 1).join('/'))), inside: i === d.length };
+  }
+  const n = I.nodes.get(x);
+  if (n?.kind === 'table') return { id: 'db:' + n.db, inside: false };
+  if (n?.kind === 'ext') return { id: n.id, inside: false };
+  return null;
+}
+function groupName(g) {
+  const t = parseTree(g);
+  if (t) return t.dir ? t.dir.split('/').slice(-2).join('/') : appName(t.app);
+  if (g.startsWith('app:')) return appName(g.slice(4));
+  if (g.startsWith('db:')) return S.g.nodes.find(n => n.kind === 'table' && n.db === g.slice(3))?.dbname || g.slice(3);
+  return labelOf(g);
+}
+function groupRoute(g) {
+  const t = parseTree(g);
+  if (t) return { v: 'tree', id: g };
+  if (g.startsWith('app:')) return { v: 'tree', id: treeId(g.slice(4), '') };
+  return { v: 'map', id: g };
+}
+function viewTree() {
+  const I = S.I, t = parseTree(S.r.id);
+  if (!t || !I.apps.has(t.app)) { go({ v: 'system' }); return; }
+  const app = t.app, dir = deepen(app, t.dir), idx = dirIndex(app), here = idx.get(dir) || { dirs: new Set(), files: [], n: 0 };
+  const name = dir ? dir.split('/').pop() : appName(app);
+  // inside: the folders and files directly in it, most connected first
+  const weight = new Map();
+  const kids = [...[...here.dirs].map(d => treeId(app, deepen(app, d))), ...here.files];
+  const agg = new Map();
+  const add = (a, b, r) => {
+    const key = a + '>' + b;
+    let e = agg.get(key);
+    if (!e) agg.set(key, e = { a, b, r: { n: 0, kinds: {}, labels: [] } });
+    e.r.n += r.n;
+    for (const [k, v] of Object.entries(r.kinds)) e.r.kinds[k] = (e.r.kinds[k] || 0) + v;
+    for (const l of r.labels) if (e.r.labels.length < 6 && !e.r.labels.includes(l)) e.r.labels.push(l);
+    weight.set(a, (weight.get(a) || 0) + r.n); weight.set(b, (weight.get(b) || 0) + r.n);
+  };
+  const inDir = f => !dir || f.rel.startsWith(dir + '/');
+  for (const f of S.g.files) {
+    if (f.app !== app || !inDir(f)) continue;
+    const gu = groupIn(app, dir, f.id);
+    for (const [v, r] of I.fout.get(f.id) || []) {
+      const gv = groupIn(app, dir, v);
+      if (gv && gv.id !== gu.id) add(gu.id, gv.inside ? gv.id : 'out|' + gv.id, r);
+    }
+    for (const [u, r] of I.fin.get(f.id) || []) {
+      const gw = groupIn(app, dir, u);
+      if (gw && !gw.inside) add('in|' + gw.id, gu.id, r);
+    }
+  }
+  const byWeight = (a, b) => (weight.get(b) || 0) - (weight.get(a) || 0);
+  const shown = kids.slice().sort(byWeight).slice(0, 40);
+  const side = p => [...new Set([...agg.values()].flatMap(e => [e.a, e.b]).filter(x => x.startsWith(p)))].sort(byWeight).slice(0, 10);
+  const ins = side('in|'), outs = side('out|');
+  const ids = [...ins, ...shown, ...outs], have = new Set(ids);
+  const edges = [...agg.values()].filter(e => have.has(e.a) && have.has(e.b)).map(e => {
+    const real = x => x.replace(/^(in|out)\|/, '');
+    return { a: e.a, b: e.b, kind: kindCls(e.r), n: e.r.n, hit: null,
+      tip: [`${groupName(real(e.a))} → ${groupName(real(e.b))}`, [edgeWords(e.r) || 'uses', plural(e.r.n, 'link')].join(' · '), ...e.r.labels.slice(0, 3)].join('\n') };
+  });
+  const fileCount = d => idx.get(parseTree(d).dir)?.n || 0;
+  const nodes = ids.map(x => {
+    const ext = /^(in|out)\|/.test(x), real = x.replace(/^(in|out)\|/, ''), sub = parseTree(real);
+    if (ext) return { id: x, cls: 'ext-c', title: groupName(real), self: kindOf(real) === 'file' ? real : undefined,
+      sub: sub ? 'folder' : real.startsWith('app:') ? 'another app' : real.startsWith('db:') ? 'database' : kindOf(real) === 'file' ? subOf(real) : 'outside service',
+      tip: 'Click to go there', stripe: real.startsWith('app:') ? `var(--app${I.appIdx.get(real.slice(4)) ?? 0})` : 'var(--line)' };
+    if (sub) {
+      const top = (idx.get(sub.dir)?.files || []).slice().sort((a, b) => I.degree(b) - I.degree(a)).slice(0, 3);
+      return { id: x, cls: 'dir-c', title: sub.dir.slice(dir ? dir.length + 1 : 0) + '/', sub: plural(fileCount(x), 'file'), tip: sub.dir,
+        desc: S.ui.simple ? (top.map(f => descOf(f)?.n).filter(Boolean).join(', ') || '') : '', stripe: `var(--app${I.appIdx.get(app) ?? 0})` };
+    }
+    return { id: x, desc: plainLine(x), meta: metaOf(x) };
+  });
+  const part = x => x.startsWith('in|') ? 0 : x.startsWith('out|') ? 2 : 1;
+  const bands = [{ label: 'Used by', ids: ins }, { label: `Inside ${name}`, ids: shown }, { label: 'Uses', ids: outs }];
+  const open = x => {
+    const real = x.replace(/^(in|out)\|/, '');
+    if (parseTree(real) || real.startsWith('app:') || real.startsWith('db:') || I.nodes.has(real)) go(groupRoute(real));
+    else go({ v: 'map', id: real });
+  };
+  if (elkReady()) mountFlow(ids, nodes, edges, { h: S.ui.simple ? FH_SIMPLE : FH, part, bands }, () => wireNodes(open));
+  else showEmpty('<h2>The layout script did not load</h2><p>Folders needs <code>web/vendor/elk</code>. The Map view still works.</p>');
+
+  crumbs([['System', { v: 'system' }], ...dirCrumbs(app, dir).slice(0, -1), [dir ? name : appName(app)]]);
+  const nDirs = here.dirs.size, nFiles = here.files.length;
+  chips([['green', 'dot', appName(app)], ['amber', 'file', plural(here.n, 'file')], nDirs && ['lilac', 'steps', plural(nDirs, 'folder')]]);
+  $('readout').innerHTML = `<b>${esc(dir || appName(app))}</b> holds ${plural(here.n, 'file')}${nDirs ? ` in ${plural(nDirs, 'folder')}` : ''}${nFiles && nDirs ? `, ${nFiles} of them directly` : ''}.
+    ${ins.length ? `<span class="k-up">${plural(ins.length, 'place')}</span> outside use it` : 'Nothing outside uses it'}; it uses <span class="k-down">${outs.length}</span>.
+    <small>Click a folder to go in, a file to see it on the map, an outside box to go there. Backspace goes up a level.</small>`;
+  legend(LINE_LEGEND.concat([[null, 'Thicker lines stand for more links']]));
+  const hiddenKids = kids.length - shown.length;
+  const files = (dir ? S.g.files.filter(f => f.app === app && inDir(f)) : S.g.files.filter(f => f.app === app)).sort((a, b) => I.degree(b.id) - I.degree(a.id));
+  $('panel').innerHTML = `<div><h2>${esc(dir ? name : appName(app))}</h2><div class="path">${esc(appName(app))} · ${esc(dir || '(app root)')}</div></div>
+    <div class="stats"><div class="stat acc"><b>${here.n}</b><span>files</span></div><div class="stat"><b>${nDirs}</b><span>folders</span></div><div class="stat"><b>${files.reduce((s, f) => s + (I.fnsByFile.get(f.id)?.length || 0), 0)}</b><span>functions</span></div></div>
+    ${nDirs ? `<div><h3>Folders</h3><ul class="list">${[...here.dirs].map(d => treeId(app, deepen(app, d))).sort(byWeight).map(d => item(['acc', fileCount(d)], esc(groupName(d)), null, null, goAttr({ v: 'tree', id: d }))).join('')}</ul></div>` : ''}
+    <div><h3>Most connected files</h3><ul class="list">${files.slice(0, 30).map(f => item(['acc', I.degree(f.id)], esc(labelOf(f.id)), null, f.rel, goAttr({ v: 'map', id: f.id }))).join('')}</ul></div>
+    ${hiddenKids > 0 ? `<p class="muted">${hiddenKids} less connected items aren't drawn; they're in the lists above.</p>` : ''}`;
+  wireList($('panel'));
 }
 
 function copyText(t, btn) {
@@ -818,7 +1310,11 @@ function viewFile() {
   const changed = changedFnSet(curTask());
   const LX = 16, LW2 = 270, MX = 400, MW = 290, RX = 820, RW = 270, TOPY = 56, R = 50;
   let s = defs();
-  let left = [], right = [], mid = fns, lines = [];
+  // Simple folds small private helpers into one row; a picked or changed one stays out
+  const helper = fn => { const base = fn.name.split('.').pop(); return ((base.startsWith('_') && !base.startsWith('__')) || (fn.kind === 'fn' && fn.name.includes('.'))) && fn.end - fn.line < 15; };
+  const folded = S.ui.simple && !S.helpersOpen ? fns.filter(fn => helper(fn) && fn.id !== sel && !changed.has(fn.id)) : [];
+  const foldRow = folded.length > 0 || (S.ui.simple && S.helpersOpen && fns.some(helper));
+  let left = [], right = [], mid = fns.filter(fn => !folded.includes(fn)), lines = [];
   const inside = id => fileOfFn(id) === fileId;
   if (sel) {
     const ins = fnEdgesIn(sel), outs = fnEdgesOut(sel);
@@ -847,12 +1343,12 @@ function viewFile() {
   const midIdx = new Map(mid.map((fn, i) => [fn.id, i]));
   const sideKey = x => sel ? (x.side === 'L' ? x.e.s : x.e.t) : x.other;
   const leftIds = left.map(x => sel ? x.s : x.id), rightIds = right.map(x => sel ? x.t : x.id);
-  const rows = Math.max(mid.length, left.length, right.length, 1);
+  const rows = Math.max(mid.length + (foldRow ? 1 : 0), left.length, right.length, 1);
   const H = TOPY + 40 + rows * R + 30, W = RX + RW + 16;
   const midY = i => TOPY + 40 + i * R;
   const sideY = i => TOPY + 40 + i * R;
   s += `<text class="lane-t" x="${LX}" y="30">${sel ? 'Called from' : 'Files that call in'}</text><text class="lane-t" x="${MX}" y="30">Inside this file</text><text class="lane-t" x="${RX}" y="30">${sel ? 'Calls out to' : 'Reaches'}</text>`;
-  s += `<rect class="cont" x="${MX - 10}" y="${TOPY - 6}" width="${MW + 20}" height="${mid.length * R + 46}" rx="10"/><text class="cont-t" x="${MX}" y="${TOPY + 14}">${esc(f.label)}</text><text class="cont-s" x="${MX}" y="${TOPY + 28}">${esc(trunc(appName(f.app) + ' · ' + f.rel, 48))}</text>`;
+  s += `<rect class="cont" x="${MX - 10}" y="${TOPY - 6}" width="${MW + 20}" height="${(mid.length + (foldRow ? 1 : 0)) * R + 46}" rx="10"/><text class="cont-t" x="${MX}" y="${TOPY + 14}">${esc(trunc(labelOf(fileId), 40))}</text><text class="cont-s${descCls(fileId)}" x="${MX}" y="${TOPY + 28}">${esc(descCls(fileId) === ' describing' ? '✦ Writing plain names for this file…' : trunc(appName(f.app) + ' · ' + f.rel, 48))}</text>`;
   const drawLines = sel || lines.length <= 120;
   const quiet = w => w === 'calls' && lines.length > 8;  // plain "calls" labels only when few, to avoid a pile-up
   if (drawLines) {
@@ -871,21 +1367,26 @@ function viewFile() {
     const k = kindOf(id);
     if (k === 'trigger') { const n = I.nodes.get(id); return row(x, sideY(i), w, n.label, 'where the flow starts', 'trig', ''); }
     if (k === 'route') { const n = I.nodes.get(id); return row(x, sideY(i), w, n.label, n.missing ? 'no backend route' : 'API route (entry)', 'trig', ''); }
-    if (k === 'fn') { const same = inside(id); return row(x, sideY(i), w, labelOf(id), same ? 'same file' : `${labelOf(fileOfFn(id))}${extraSub || ''}`, changed.has(id) ? 'chg' : '', same ? `data-self="${esc(id)}"` : `data-go="${esc(JSON.stringify(openRoute(id)))}"`); }
-    return row(x, sideY(i), w, labelOf(id), subOf(id) + (extraSub || ''), 'file', `data-go="${esc(JSON.stringify({ v: k === 'file' ? 'file' : 'map', id }))}"`);
+    if (k === 'fn') { const same = inside(id); return row(x, sideY(i), w, labelOf(id), same ? 'same file' : `${labelOf(fileOfFn(id))}${extraSub || ''}`, (changed.has(id) ? 'chg' : '') + descCls(id), same ? `data-self="${esc(id)}"` : `data-go="${esc(JSON.stringify(openRoute(id)))}"`); }
+    return row(x, sideY(i), w, labelOf(id), subOf(id) + (extraSub || ''), 'file' + descCls(id), `data-go="${esc(JSON.stringify({ v: k === 'file' ? 'file' : 'map', id }))}"`);
   };
   left.forEach((x, i) => s += sideRow(LX, i, LW2, sel ? x.s : x.id, sel ? '' : ` · ${x.n} call${x.n === 1 ? '' : 's'}`));
   right.forEach((x, i) => s += sideRow(RX, i, RW, sel ? x.t : x.id, sel ? '' : ` · ${x.n}`));
   mid.forEach((fn, i) => {
     const nin = fnEdgesIn(fn.id).length, nout = fnEdgesOut(fn.id).length;
     const ch = changed.get(fn.id);
-    const sub = ch ? `${ch} by Claude · line ${fn.line}` : `line ${fn.line} · ${nin} in · ${nout} out`;
-    s += row(MX, midY(i), MW, fnShort(fn.name) + (fn.kind === 'component' ? '' : '()'), sub, (sel === fn.id ? 'on' : sel ? 'dim' : '') + (ch ? (ch === 'added' ? ' added' : ' chg') : ''), `data-self="${esc(fn.id)}"`);
+    const plain = S.ui.simple && descOf(fn.id) ? labelOf(fn.id, true) + ' · ' : '';  // Simple keeps the code's name on the second line
+    const sub = plain + (ch ? `${ch} by Claude · line ${fn.line}` : `line ${fn.line} · ${nin} in · ${nout} out`);
+    s += row(MX, midY(i), MW, labelOf(fn.id), sub, (sel === fn.id ? 'on' : sel ? 'dim' : '') + (ch ? (ch === 'added' ? ' added' : ' chg') : '') + descCls(fn.id), `data-self="${esc(fn.id)}"`);
   });
+  if (foldRow) s += folded.length
+    ? row(MX, midY(mid.length), MW, `+ ${plural(folded.length, 'small helper')}`, folded.map(fn => fnShort(fn.name)).join(', '), 'more', 'data-helpers="1"')
+    : row(MX, midY(mid.length), MW, 'Fold small helpers', 'private or nested functions under 15 lines', 'more', 'data-helpers="1"');
   if (!fns.length) s += `<text class="cont-s" x="${MX}" y="${TOPY + 60}">No functions found in this file.</text>`;
   mountSvg(s, W, H);
   $('svg').querySelectorAll('.row').forEach(el => {
     const goRow = () => {
+      if (el.dataset.helpers) { S.helpersOpen = !S.helpersOpen; render(); return; }
       if (el.dataset.self) go({ v: 'file', id: fileId, fn: S.r.fn === el.dataset.self ? undefined : el.dataset.self });
       else if (el.dataset.go) go(JSON.parse(el.dataset.go));
     };
@@ -893,7 +1394,7 @@ function viewFile() {
     el.addEventListener('keydown', ev => { if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); goRow(); } });
   });
 
-  crumbs([['System', { v: 'system' }], [f.label, { v: 'map', id: fileId }], ...(sel ? [[labelOf(sel)]] : [['Inside']])]);
+  crumbs([['System', { v: 'system' }], [labelOf(fileId), { v: 'map', id: fileId }], ...(sel ? [[labelOf(sel)]] : [['Inside']])]);
   chips([['green', 'dot', appName(f.app)], ['amber', 'fn', plural(fns.length, 'function')]]);
   legend([['var(--accent)', 'Selected function / call'], ['var(--down)', 'Where a flow starts'], [null, 'Click a function to trace it; click a box on either side to step into that file']]);
   const P = $('panel');
@@ -901,9 +1402,9 @@ function viewFile() {
     const nIn = new Set(left.map(x => x.id)).size, nOut = right.length;
     $('readout').innerHTML = `<b>${esc(f.label)}</b> has ${plural(fns.length, 'function')}. <span class="k-up">${plural(nIn, 'file')}</span> call into it; it reaches <span class="k-down">${nOut}</span>.
       <small>Click a function to see its calls and trace it back to where the flow starts.${!drawLines ? ' Lines are hidden because there are too many; pick a function.' : ''}</small>`;
-    P.innerHTML = `<div><h2>${esc(f.label)}</h2><div class="path">${esc(appName(f.app) + ' · ' + f.rel)}</div></div>
+    P.innerHTML = `<div><h2>${esc(labelOf(fileId))}</h2><div class="path">${esc(appName(f.app) + ' · ' + f.rel)}</div>${aiNote(fileId)}</div>
       <div class="row-btns"><button class="btn2" id="tomap">Show on map</button><button class="btn2" id="copy">Copy path</button></div>
-      <div><h3>Functions</h3><ul class="list">${fns.map(fn => item([changed.get(fn.id) ? 'acc' : '', changed.get(fn.id) || ('line ' + fn.line)], esc(fnShort(fn.name)), `${fnEdgesIn(fn.id).length} in · ${fnEdgesOut(fn.id).length} out`, null, goAttr({ v: 'file', id: fileId, fn: fn.id }))).join('')}</ul></div>`;
+      <div><h3>Functions</h3><ul class="list">${fns.map(fn => item([changed.get(fn.id) ? 'acc' : '', changed.get(fn.id) || ('line ' + fn.line)], esc(labelOf(fn.id)), `${S.ui.simple && descOf(fn.id) ? esc(fnShort(fn.name)) + ' · ' : ''}${fnEdgesIn(fn.id).length} in · ${fnEdgesOut(fn.id).length} out`, null, goAttr({ v: 'file', id: fileId, fn: fn.id }))).join('')}</ul></div>`;
     $('tomap').onclick = () => go({ v: 'map', id: fileId });
     $('copy').onclick = () => copyText(absPath(fileId), $('copy'));
     wireList(P);
@@ -914,12 +1415,14 @@ function viewFile() {
   const up = upstreamFns([sel]);
   const upFiles = new Set([...up].map(fileOfFn).filter(Boolean));
   const entryText = chain[0]?.start ? labelOf(chain[0].id) : null;
-  $('readout').innerHTML = `<b class="code">${esc(fnShort(fn.name))}</b> has <span class="k-up">${plural(left.length, 'way')} in</span> and <span class="k-down">${right.length}</span> out.
+  $('readout').innerHTML = `${S.ui.simple && descOf(sel) ? `<b>${esc(labelOf(sel))}</b>` : `<b class="code">${esc(fnShort(fn.name))}</b>`} has <span class="k-up">${plural(left.length, 'way')} in</span> and <span class="k-down">${right.length}</span> out.
     <small>${entryText ? `Starts at: ${chain.map(st => st.start ? `<span class="pill down">start</span> ${esc(labelOf(st.id))}` : `<span class="code">${esc(labelOf(st.id))}</span>${st.via ? ` <span class="pill acc">${esc(st.via)}</span>` : ''}`).join(' → ')}` : 'No caller found in the code. It may be called from outside (a framework, a test, or by name).'}</small>`;
   const ch = changed.get(sel);
-  P.innerHTML = `<div><h2 class="code">${esc(fn.name)}</h2><div class="path">${esc(f.rel)}:${fn.line}–${fn.end}</div></div>
+  const plainName = S.ui.simple && descOf(sel);
+  P.innerHTML = `<div>${plainName ? `<h2>${esc(labelOf(sel))}</h2><div class="path code">${esc(fn.name)}</div>` : `<h2 class="code">${esc(fn.name)}</h2>`}<div class="path">${esc(f.rel)}:${fn.line}–${fn.end}</div>${aiNote(sel)}</div>
     ${ch ? `<div class="callout a"><b>${esc(ch)} by Claude in this session</b>See the Live view for the whole change.</div>` : ''}
     <div class="stats"><div class="stat up"><b>${left.length}</b><span>ways in</span></div><div class="stat down"><b>${right.length}</b><span>calls out</span></div><div class="stat acc"><b>${upFiles.size}</b><span>files upstream (3 hops)</span></div></div>
+    ${flowSection(chain)}
     <div><h3>Where it starts</h3>${chain.length > 1 || chain[0]?.start ? `<ul class="list">${chain.map(st => st.start ? item(['down', 'start'], esc(labelOf(st.id)), null, pathOf(I.nodes.get(st.id)?.file || st.id)) : item(['acc', st.via ? st.via.split(' ')[0] : 'call'], esc(labelOf(st.id)), st.via ? esc(st.via) : null, pathOf(st.id), goAttr(openRoute(st.id)))).join('')}</ul>` : '<p>No caller found in the code.</p>'}</div>
     <div><h3>Code</h3><pre class="src" id="src">Loading…</pre></div>
     <div class="row-btns"><button class="btn2" id="copy">Copy path:line</button></div>`;
@@ -1006,6 +1509,7 @@ function evText(e) {
     delete: [['risk', 'deleted'], f],
     test: [[e.failed ? 'risk' : 'down', 'test'], e.passed != null ? `${e.passed} passed, ${e.failed} failed` : trunc(e.text, 60)],
     stop: [['down', 'done'], 'Claude finished'],
+    handback: [['new', 'helper'], trunc(e.text || 'A helper finished its part', 140)],
   }[e.k] || [['', e.k], ''];
 }
 
@@ -1272,7 +1776,7 @@ function stepTo(t, n) {
   const r = { ...S.r, v: 'live' }; delete r.step;
   go(n >= t.events.length ? r : { ...r, step: n });
 }
-const STEP_WORD = { prompt: 'Your request', read: 'Read', search: 'Search', run: 'Shell', plan: 'Plan', create: 'Create', edit: 'Edit', delete: 'Delete', test: 'Tests', stop: 'Done' };
+const STEP_WORD = { handback: 'Helper done', prompt: 'Your request', read: 'Read', search: 'Search', run: 'Shell', plan: 'Plan', create: 'Create', edit: 'Edit', delete: 'Delete', test: 'Tests', stop: 'Done' };
 const STEP_HINT = {
   prompt: 'Your request. Everything after this is Claude working on it.',
   read: 'Claude opened a file. Functions on the lines it read are numbered on the map in the order it looked.',
@@ -1284,6 +1788,7 @@ const STEP_HINT = {
   delete: 'A file was removed.',
   test: 'Tests ran. The result is counted further down this panel.',
   stop: 'Claude finished this request. Step back through it with ← or press Replay.',
+  handback: 'Claude had handed part of this request to a helper (a subagent). This is the helper reporting back; the request carries on.',
   shot: 'Claude took screenshots of the app and is looking at them to see whether the change looks right. Screenshots are not on the map.',
 };
 const hintFor = e => isShot(e) || (e.k === 'run' && /screenshots/.test(shellWhat(e.text))) ? STEP_HINT.shot : STEP_HINT[e.k] || '';
@@ -1299,6 +1804,7 @@ function shellWhat(cmd) {
   if (/\b(npm|pnpm|yarn) (i|install|add)\b/.test(c)) return 'Installed packages';
   if (/\b(npm|pnpm|yarn) (run )?(dev|start)\b/.test(c)) return 'Started the app';
   if (/\b(magick|convert|ffmpeg)\b/.test(c)) return 'Processed an image';
+  if (/\bgit\s+commit\b/.test(c)) return 'Committed the changes';
   if (/^\s*git\b/.test(c)) return 'Checked git';
   if (/^\s*(ls|find|tree|wc)\b/.test(c)) return 'Listed files';
   return 'Ran ' + (c.trim().split(/\s+/)[0] || 'a command');
@@ -1331,6 +1837,7 @@ function describeStep(e) {
     delete: ['Deleted ' + f, 'Delete ' + f],
     test: ['Ran the tests', 'Tests'],
     stop: ['Claude finished', 'Done'],
+    handback: ['A helper finished its part', 'Helper done'],
   }[e.k] || [e.k, e.k];
 }
 const stepLabel = e => describeStep(e)[1];
@@ -1341,6 +1848,7 @@ function phasesOf(events) {
     let k;
     if (e.k === 'prompt') k = 'ask';
     else if (e.k === 'stop') k = 'done';
+    else if (e.k === 'handback') k = out[out.length - 1]?.k === 'done' ? 'explore' : out[out.length - 1]?.k || 'explore';  // the work carries on
     else if (e.k === 'plan') k = 'plan';
     else if (['edit', 'create', 'delete'].includes(e.k)) { k = 'change'; if (e.file) edited.add(e.file); }
     else if (e.k === 'test' || isShot(e)) k = 'check';
@@ -1361,6 +1869,144 @@ function phasesOf(events) {
   }
   return out;
 }
+
+// ---------- Live: change view ----------
+// What a change does to the architecture, at three zoom levels: areas (a folder inside one layer of one app)
+// → the files in an area (click it) → a file's functions and code (click a file). Files Claude only read are
+// left out unless asked for, so what changed and what it knocks on stay in front.
+const SRC_ROOTS = new Set(['app', 'src', 'lib', 'source', 'pkg', 'internal']);
+function areaOf(fid) {
+  const f = S.I.files.get(fid); if (!f) return null;
+  let dirs = f.rel.split('/').slice(0, -1);
+  if (dirs.length > 1 && SRC_ROOTS.has(dirs[0])) dirs = dirs.slice(1);
+  return `area:${f.app}:${f.role}:${dirs.slice(0, 2).join('/') || '.'}`;
+}
+const areaDir = a => a.split(':').slice(3).join(':');
+// changed functions each file on the ripple reaches (up to 3 calls away): "uses tweet_from_graphql"
+function usesChanged(t, changed) {
+  const out = new Map();
+  for (const rf of t.ripple_fns || []) {
+    const file = fileOfFn(rf); if (!file) continue;
+    let q = [rf]; const seen = new Set(q), hit = [];
+    for (let d = 0; d < 3 && q.length && !hit.length; d++) {
+      const nx = [];
+      for (const a of q) for (const e of fnEdgesOut(a)) {
+        if (changed.has(e.t)) hit.push(e.t); else if (!seen.has(e.t) && e.t.startsWith('fn:')) { seen.add(e.t); nx.push(e.t); }
+      }
+      q = nx;
+    }
+    if (hit.length) { const s = out.get(file) || out.set(file, new Set()).get(file); hit.forEach(h => s.add(fnShort(S.I.fns.get(h)?.name || h.split('#').pop()))); }
+  }
+  return out;
+}
+// keep an open area's files together in their column, under a header, and lay the columns out top to bottom
+function groupLanes(L, groupOf) {
+  const groups = [];
+  let H = 0;
+  for (const lane of L.lanes) {
+    const placed = new Set(), order = [];
+    for (const id of lane.members) {
+      if (placed.has(id)) continue;
+      const g = groupOf(id);
+      const batch = g ? lane.members.filter(m => groupOf(m) === g) : [id];
+      batch.forEach(m => { placed.add(m); order.push(m); });
+    }
+    lane.members = order;
+    let y = TOP, cur = null;
+    for (const id of order) {
+      const g = groupOf(id);
+      if (g !== cur) { if (cur) { groups[groups.length - 1].y1 = y - RH + NH; y += 14; } if (g) { y += 22; groups.push({ key: g, x: lane.x, y0: y }); } cur = g; }
+      L.pos.set(id, { x: lane.x, y });
+      y += RH;
+    }
+    if (cur) { groups[groups.length - 1].y1 = y - RH + NH; y += 14; }
+    H = Math.max(H, y);
+  }
+  L.H = H + 20;
+  return groups;
+}
+function viewChange(t, evs, live) {
+  const I = S.I, sm = t.summary;
+  S.openAreas = S.openAreas || new Set();
+  const changed = new Set(live.order.filter(f => I.files.has(f)));
+  const flagged = new Map([...(sm.off_plan || []).map(f => [f, 'not in the plan']), ...(sm.stray || []).map(f => [f, 'nothing else in this change connects to it'])].filter(([f]) => changed.has(f)));
+  const ripple = changed.size ? (t.ripple_files || []).filter(f => I.files.has(f) && !changed.has(f)) : [];
+  const planned = (t.planned || []).filter(f => I.files.has(f) && !changed.has(f));
+  const reads = S.showReads ? [...new Set(evs.flatMap(e => e.k === 'read' && e.file ? [e.file] : e.k === 'search' ? (e.files || []).slice(0, 3) : []))].filter(f => I.files.has(f) && !changed.has(f) && !ripple.includes(f) && !planned.includes(f)) : [];
+  const files = [...changed, ...ripple, ...planned, ...reads];
+  const status = f => flagged.has(f) ? 'warn' : changed.has(f) ? (t.touched[f]?.status === 'created' ? 'new' : 'edit') : ripple.includes(f) ? 'up' : planned.includes(f) ? 'ghost' : 'read';
+  // tables the changed functions read or write
+  const cfns = changedFnSet(t);
+  const tables = [...new Set([...cfns.keys()].flatMap(fn => fnEdgesOut(fn).filter(e => e.t.startsWith('tb:')).map(e => e.t)))].slice(0, 6);
+  const unitOf = new Map(files.map(f => { const a = areaOf(f); return [f, S.openAreas.has(a) ? f : a]; }));
+  tables.forEach(tb => unitOf.set(tb, tb));
+  S.unitOf = unitOf;
+  const members = new Map();
+  for (const f of files) { const u = unitOf.get(f); if (u.startsWith('area:')) (members.get(u) || members.set(u, []).get(u)).push(f); }
+  const units = [...new Set(unitOf.values())];
+  (t.planned_new || []).slice(0, 8).forEach(p => { if (!Object.keys(t.touched).some(f => f.endsWith(p))) units.push('new:' + p); });
+  // links: calls (and table use) between the units; imports where no call joins two units
+  const edges = new Map();
+  const link = (ua, ub, cls) => { if (!ua || !ub || ua === ub) return; const k = ua + '>' + ub; if (!edges.has(k) || edges.get(k).cls === 'imp') edges.set(k, { a: ua, b: ub, cls }); };
+  const ST = { edit: 2, new: 2, warn: 2, up: 1 };
+  for (const a of [...files, ...tables]) for (const [b] of (I.fout.get(a) || new Map())) {
+    if (!unitOf.has(b)) continue;
+    const sa = ST[status(a)] || 0, sb = b.startsWith('tb:') ? 2 : ST[status(b)] || 0;
+    link(unitOf.get(a), unitOf.get(b), sa === 2 && sb === 2 ? 'hot' : sa === 1 && sb === 2 ? 'up' : 'faint');
+  }
+  for (const a of files) for (const b of (S.g.imports?.[a] || [])) if (unitOf.has(b)) link(unitOf.get(a), unitOf.get(b), 'imp');
+  const E = [...edges.values()];
+  const laneOfUnit = u => u.startsWith('area:') ? u.split(':')[2] : laneOf(u);
+  const L = layout(units, E.map(e => [e.a, e.b]), { lane: laneOfUnit });
+  const groupOf = u => u.startsWith('f:') && S.openAreas.has(areaOf(u)) ? areaOf(u) : null;
+  const groups = groupLanes(L, groupOf);
+  const uses = usesChanged(t, cfns);
+  const fnList = f => Object.entries(t.touched[f]?.fns || {}).map(([q, st]) => ({ added: '+', changed: '~', removed: '−' }[st] + ' ' + fnShort(q).split('.').pop()));
+  const multiApp = new Set(files.map(f => I.files.get(f).app)).size > 1;
+  const nodes = units.map(u => {
+    if (u.startsWith('area:')) {
+      const ms = members.get(u), cnt = k => ms.filter(f => status(f) === k).length;
+      const nCh = cnt('edit') + cnt('warn'), nNew = cnt('new');
+      const parts = [nCh && `${nCh} changed`, nNew && `${nNew} new`, cnt('up') && `${cnt('up')} to recheck`, cnt('ghost') && `${cnt('ghost')} planned`, cnt('read') && `${cnt('read')} read`].filter(Boolean);
+      const names = ms.length <= 2 ? ms.map(f => labelOf(f)).join(', ') + ' · ' : '';
+      const top = ['warn', 'edit', 'new', 'up', 'ghost', 'read'].find(k => cnt(k));
+      const app = I.apps.get(I.files.get(ms[0]).app);
+      return { id: u, cls: top + (ms.some(f => live.cls.get(f)?.includes('cur')) ? ' cur' : ''), title: (multiApp ? appName(app.id) + ' · ' : '') + areaDir(u), sub: names + parts.join(' · '),
+        tip: `${app.name} · ${areaDir(u)}\n${ms.map(f => labelOf(f) + ' — ' + ({ warn: 'changed, probably not needed', edit: 'changed', new: 'new', up: 'uses changed code', ghost: 'planned', read: 'read' }[status(f)])).join('\n')}\nClick to see the files`,
+        stripe: `var(--app${I.appIdx.get(app.id) ?? 0})`, badge: cnt('warn') ? '!' : nCh + nNew ? String(nCh + nNew) : null, badgeColor: cnt('warn') ? 'var(--warn)' : 'var(--accent)' };
+    }
+    if (u.startsWith('f:')) {
+      const st = status(u);
+      const sub = st === 'warn' ? '! ' + flagged.get(u) : st === 'edit' || st === 'new' ? (fnList(u).join(' ') || (st === 'new' ? 'new file' : 'fields or constants changed'))
+        : st === 'up' ? (uses.get(u) ? 'uses ' + [...uses.get(u)].join(', ') : 'uses changed code') : st === 'ghost' ? 'planned, not touched yet' : 'only read';
+      return { id: u, cls: st + (live.cls.get(u)?.includes('cur') ? ' cur' : ''), sub, tip: `${pathOf(u)}\n${sub}`, badge: st === 'warn' ? '!' : null, badgeColor: 'var(--warn)' };
+    }
+    if (u.startsWith('new:')) return { id: u, cls: 'ghost', stripe: 'var(--ghost)' };
+    return { id: u, cls: 'data', sub: 'table · ' + subOf(u) };
+  });
+  const under = groups.map(g => `<g class="grp" data-area="${esc(g.key)}" role="button" tabindex="0"><title>Click to fold these files back into one box</title><rect x="${g.x - 6}" y="${g.y0 - 24}" width="${NW + 12}" height="${g.y1 - g.y0 + 32}" rx="9"/><text x="${g.x + 2}" y="${g.y0 - 9}">▾ ${esc(trunc(areaDir(g.key), 28))}</text></g>`).join('');
+  mountSvg(drawLanes(L, nodes, E.map(e => ({ ...e, cls: e.cls === 'imp' ? 'imp' : e.cls })), { maxLabels: 0, under }), L.W, L.H);
+  const toggle = a => { S.openAreas.has(a) ? S.openAreas.delete(a) : S.openAreas.add(a); render(); };
+  wireNodes(n => { if (n.startsWith('area:')) toggle(n); else if (n.startsWith('f:')) go({ v: 'file', id: n }); else if (!n.startsWith('new:')) go({ v: 'map', id: n }); });
+  $('svg').querySelectorAll('.grp').forEach(g => { g.onclick = () => toggle(g.dataset.area); g.onkeydown = e => { if (e.key === 'Enter') toggle(g.dataset.area); }; });
+  // the toolbar: zoom controls, and anything that needs a look first
+  const areas = new Set(files.filter(f => changed.has(f)).map(areaOf));
+  const warn = [...flagged].map(([f, why]) => `<span class="k-warn">⚠ <button class="linkbtn" data-area="${esc(areaOf(f))}">${esc(labelOf(f))}</button> changed, but ${esc(why)}</span>`).join('');
+  tools(`<button class="btn2" id="openall">${[...areas].every(a => S.openAreas.has(a)) && areas.size ? 'Fold all areas' : 'Show all files'}</button>
+    <label><input type="checkbox" id="showreads" ${S.showReads ? 'checked' : ''}> Show what it only read</label>
+    ${t.running ? `<span><b>Running now:</b> <span class="code">${esc(trunc(t.running.text, 100))}</span></span>` : ''}${warn}`);
+  $('openall').onclick = () => { const all = [...areas].every(a => S.openAreas.has(a)); areas.forEach(a => all ? S.openAreas.delete(a) : S.openAreas.add(a)); render(); };
+  $('showreads').onchange = e => { S.showReads = e.target.checked; render(); };
+  $('tools').querySelectorAll('.linkbtn').forEach(b => b.onclick = () => { S.openAreas.add(b.dataset.area); render(); });
+  legend([['var(--accent)', 'Changed (the number counts changed files)'], ['var(--down)', 'New'], ['var(--up)', 'Uses changed code: recheck it'], ['var(--warn)', '! Probably not needed'], [null, 'Click an area for its files, a file for its code · dashed line = imports']]);
+  return { files: changed.size, areas: areas.size, recheck: ripple.length };
+}
+// dim everything on the canvas except the boxes holding these files (hovering a phase or a story line)
+function highlightFiles(fileIds) {
+  const want = new Set([...(fileIds || [])].map(f => S.unitOf?.get(f) || f));
+  $('svg').querySelectorAll('.node').forEach(n => n.classList.toggle('dim', !!fileIds && !want.has(n.dataset.id)));
+}
+const phaseFiles = ph => ph.ev.flatMap(e => e.file ? [e.file] : e.files || []);
 
 function viewLive() {
   const I = S.I;
@@ -1398,6 +2044,7 @@ function viewLive() {
   const rp = S.replay && S.replay.key === S.sess.id + ':' + S.sess.tasks.indexOf(t) ? S.replay : (S.r.step ? { upto: +S.r.step } : null);
   const evs = rp ? t.events.slice(0, rp.upto) : t.events;
   const live = liveClasses(evs, true);
+  let change = null;
   const edges = [];
   for (const a of ids) for (const [b, r] of (I.fout.get(a) || new Map())) if (ids.has(b)) {
     const hot = x => t.touched[x] || ripple.includes(x);
@@ -1446,12 +2093,12 @@ function viewLive() {
       ${tables.length ? `<h3>Tables it queried</h3><ul class="list">${tables.map(n => item(['down', 'table'], esc(n.label), esc(n.dbname) + ' · ' + plural((S.I.inn.get(n.id) || []).length, 'function') + ' use it', null, goAttr({ v: 'map', id: n.id }))).join('')}</ul><p>Click one to see the code that reads and writes it.</p>` : ''}`);
   } else if (!ids.size) {
     showEmpty(`<h2>${t.prompt ? 'Claude is getting started' : 'Waiting'}</h2><p>Files will appear here as Claude reads and edits them.</p>`);
+  } else if (live.order.length || (t.planned || []).length) {
+    change = viewChange(t, evs, live);
   } else {
+    // nothing changed yet at this step: what Claude has opened so far
     const L = layout([...ids], edges.map(e => [e.a, e.b]));
-    const lookedIn = new Map((t.looked || []).map(x => [x.file, x.fns.map(f => fnShort(f.name))]));
-    const nodes = [...ids].map(n => ({ id: n, cls: n.startsWith('new:') ? 'ghost' : (live.cls.get(n) || (reads.includes(n) ? 'read' : '')), badge: live.badge.get(n), badgeColor: live.badgeColor.get(n), stripe: n.startsWith('new:') ? 'var(--ghost)' : undefined,
-      sub: live.order.includes(n) ? (Object.keys(t.touched[n]?.fns || {}).length ? plural(Object.keys(t.touched[n].fns).length, 'function') + ' changed' : 'edited outside functions')
-        : live.cls.get(n)?.startsWith('up') ? 'uses changed code' : lookedIn.get(n)?.length ? 'looked at ' + lookedIn.get(n).join(', ') : undefined }));
+    const nodes = [...ids].map(n => ({ id: n, cls: n.startsWith('new:') ? 'ghost' : (live.cls.get(n) || (reads.includes(n) ? 'read' : '')), stripe: n.startsWith('new:') ? 'var(--ghost)' : undefined, sub: live.cls.get(n)?.startsWith('up') ? 'uses changed code' : undefined }));
     mountSvg(drawLanes(L, nodes, edges, { maxLabels: 0 }), L.W, L.H);
     wireNodes(n => { if (n.startsWith('new:')) return; go(kindOf(n) === 'file' ? { v: 'file', id: n } : { v: 'map', id: n }); });
   }
@@ -1473,9 +2120,15 @@ function viewLive() {
     delete: `<b>${esc(txt)}</b> was deleted.`,
     test: `<b>Tests ran:</b> ${esc(txt)}.`,
     stop: `<b>Claude finished.</b>`,
+    handback: `A helper Claude started reported back: ${esc(txt)}`,
   }[last.k] || esc(txt);
   const nLooked = (t.looked || []).reduce((n, x) => n + x.fns.length, 0);
   if (answer) $('readout').innerHTML = `${lastLine}<small>Question only, nothing changed · ${plural(nLooked, 'function')} looked at in ${plural((t.reads || []).length, 'file')} · the map shows where the clearest ones sit in the flow</small>`;
+  else if (change) {
+    const tests = sm.tests ? (sm.tests.failed ? `<span class="k-warn">tests ✗ ${sm.tests.failed} failing</span>` : sm.tests.passed != null ? `<span class="k-down">tests ✓ ${sm.tests.passed} passed</span>` : sm.tests.failed === 0 ? '<span class="k-down">tests ✓ none failing</span>' : 'tests ran') : 'no tests run yet';
+    const nWarn = (sm.off_plan || []).length + (sm.stray || []).length;
+    $('readout').innerHTML = `<b>${t.ended ? 'Changed' : 'Changing'}</b> · ${plural(change.files, 'file')} in ${plural(change.areas, 'area')} · <span class="k-up">${change.recheck} to recheck</span>${nWarn ? ` · <span class="k-warn">${nWarn} probably not needed</span>` : ''} · ${tests}<small>${lastLine}</small>`;
+  }
   else $('readout').innerHTML = `${lastLine}<small>${plural((t.reads || []).length, 'file')} read · ${sm.edited} edited, ${sm.created} created · ${(sm.fns.changed || 0) + (sm.fns.added || 0) + (sm.fns.removed || 0)} functions changed · <span class="k-up">${sm.ripple_files} other files call changed code</span>${sm.off_plan.length ? ` · <span class="k-warn">${sm.off_plan.length} outside the plan</span>` : ''}</small>`;
 
   const P = $('panel');
@@ -1490,9 +2143,10 @@ function viewLive() {
   sb.hidden = !N;
   const phases = phasesOf(t.events);
   const curPh = phases.find(ph => at - 1 >= ph.from && at - 1 <= ph.to);
-  sb.innerHTML = `<div class="stepper-h"><b>In this request</b><span>Step ${at} of ${N}${curPh ? ' · ' + esc(curPh.label) : ''}</span></div>
+  sb.innerHTML = `<div class="stepper-h"><b>Steps</b><span>Step ${at} of ${N}${curPh ? ' · ' + esc(curPh.label) : ''} · <span class="fold-hint"></span></span></div>
     <div class="steps" id="steps">${phases.map(ph => `<div class="phase ph-${ph.k} ${ph === curPh ? 'on' : ''}"><div class="ph-h" title="${esc(ph.label)}">${esc(ph.label)}${ph.ev.length > 1 ? ` <small>${ph.ev.length}</small>` : ''}</div><div class="ph-steps">${ph.ev.map((e, j) => { const i = ph.from + j; return `<button class="step k-${e.k} ${i + 1 < at ? 'done' : i + 1 === at ? 'cur' : ''}" data-n="${i + 1}" title="${esc(describeStep(e)[0] + ' · ' + evText(e)[1])}"><span class="n">${i + 1}</span><span class="l">${esc(stepLabel(e))}</span></button>`; }).join('')}</div></div>`).join('')}</div>`;
   sb.querySelectorAll('.step').forEach(b => b.onclick = () => stepTo(t, +b.dataset.n));
+  sb.querySelectorAll('.phase').forEach((el, i) => { el.onmouseenter = () => highlightFiles(phaseFiles(phases[i])); el.onmouseleave = () => highlightFiles(null); });
   const curStep = sb.querySelector('.step.cur'); if (curStep) { const box = $('steps'); box.scrollLeft = curStep.offsetLeft - box.clientWidth / 2 + curStep.offsetWidth / 2; }
   const nextE = t.events[at];
   const stepCard = !last ? '' : `<div class="stepcard">
@@ -1521,10 +2175,11 @@ function viewLive() {
       <div class="stat down"><b>${sm.created}</b><span>files created</span></div>
       <div class="stat acc"><b>${(sm.fns.changed || 0) + (sm.fns.added || 0) + (sm.fns.removed || 0)}</b><span>functions changed</span></div>
       <div class="stat up"><b>${sm.ripple_files}</b><span>files to recheck</span></div>
-      <div class="stat warn"><b>${sm.off_plan.length}</b><span>outside the plan</span></div>
+      <div class="stat warn"><b>${sm.off_plan.length + (sm.stray || []).length}</b><span>probably not needed</span></div>
       <div class="stat ${sm.tests?.failed ? 'warn' : 'down'}"><b>${sm.tests ? (sm.tests.failed ?? '?') : '–'}</b><span>tests failing</span></div>
     </div>
     ${sm.off_plan.map(f => `<div class="callout"><b>Look here first: ${esc(labelOf(f))}</b>Changed outside the plan: ${esc(Object.keys(t.touched[f].fns).join(', ') || 'no function changes')}</div>`).join('')}
+    ${(sm.stray || []).map(f => `<div class="callout"><b>Look here first: ${esc(labelOf(f))}</b>Changed, but no call, import or table links it to anything else in this change. It may belong to something else.</div>`).join('')}
     ${touched.length ? `<div><h3>Changed functions</h3><ul class="list">${touched.flatMap(f => Object.entries(t.touched[f].fns).map(([q, st]) => item([st === 'added' ? 'down' : st === 'removed' ? 'risk' : 'acc', st], esc(fnShort(q)), null, I.files.get(f)?.rel || f, st !== 'removed' ? goAttr({ v: 'file', id: f, fn: f.replace('f:', 'fn:') + '#' + q }) : ''))).join('')}</ul></div>` : ''}
     ${(t.looked || []).length ? `<div><h3>Functions Claude looked at</h3><ul class="list">${[...t.looked].reverse().flatMap(x => x.fns.map(f => [x, f])).sort((a, b) => (a[1].how === 'read' ? 0 : 1) - (b[1].how === 'read' ? 0 : 1) || (b[1].score || 0) - (a[1].score || 0)).map(([x, f]) => item(['', f.how === 'read' ? 'read' : 'found'], esc(fnShort(f.name)), null, I.files.get(x.file)?.rel || x.file, goAttr(openRoute(x.file.replace('f:', 'fn:') + '#' + f.name)))).slice(0, 15).join('')}</ul></div>` : ''}
     ${ripple.length ? `<div><h3>Calls changed code (recheck)</h3><ul class="list">${ripple.slice(0, 20).map(f => item(['up', 'calls'], esc(labelOf(f)), null, I.files.get(f)?.rel, goAttr({ v: 'file', id: f }))).join('')}</ul></div>` : ''}
@@ -1534,7 +2189,11 @@ function viewLive() {
   wireList(P);
   if ($('sback')) { $('sback').onclick = () => S.stepNav(-1); $('snext').onclick = () => S.stepNav(1); $('replay').onclick = S.replayNav; }
   if ($('slatest')) $('slatest').onclick = () => stepTo(t, N);
-  P.querySelectorAll('.story li').forEach(li => li.onclick = () => stepTo(t, +li.dataset.n));
+  P.querySelectorAll('.story li').forEach(li => {
+    li.onclick = () => stepTo(t, +li.dataset.n);
+    const ph = phases.find(x => x.from + 1 === +li.dataset.n);
+    li.onmouseenter = () => ph && highlightFiles(phaseFiles(ph)); li.onmouseleave = () => highlightFiles(null);
+  });
   const tl = $('tl'); if (tl) { const at = rp && tl.querySelector('li.last'); if (at) tl.scrollTop = at.offsetTop - tl.clientHeight / 2; else tl.scrollTop = tl.scrollHeight; }
   $('sess').onchange = e => { S.taskIdx = null; go({ v: 'live', sid: e.target.value, p: e.target.selectedOptions[0].dataset.p }); };
   if ($('task')) $('task').onchange = e => { S.taskIdx = +e.target.value; render(); };
@@ -1699,6 +2358,14 @@ document.addEventListener('keydown', e => {
   if (e.key === '/') { e.preventDefault(); $('q').focus(); return; }
   if (e.key === '[' || e.key === ']') { const k = e.key === '[' ? 'side' : 'panel'; setUI({ [k]: !S.ui[k] }); return; }
   if ((e.key === 'f' || e.key === 'F') && $('vp')) { fitView(true); return; }
+  if ((e.key === 's' || e.key === 'S') && S.g) { toggleSimple(); return; }
+  if (e.key === 'Backspace' && S.r.v === 'tree') {  // up a level: folder → its parent → the app → System
+    const t = parseTree(S.r.id), d = t && deepen(t.app, t.dir);
+    if (!t || !d) { go({ v: 'system', id: t ? 'app:' + t.app : undefined }); return; }
+    let up = d.split('/').slice(0, -1).join('/');
+    while (up && deepen(t.app, up) === d) up = up.split('/').slice(0, -1).join('/');  // past folders that only hold this one
+    go(deepen(t.app, up) === d ? { v: 'system', id: 'app:' + t.app } : { v: 'tree', id: treeId(t.app, up) }); return;
+  }
   if (S.r.v !== 'live' || !S.stepNav || (e.key === ' ' && document.activeElement.tagName === 'BUTTON')) return;
   if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') { e.preventDefault(); S.stepNav(e.key === 'ArrowLeft' ? -1 : 1); }
   else if (e.key === 'r' || e.key === 'R' || e.key === ' ') { e.preventDefault(); S.replayNav(); }
@@ -1728,8 +2395,10 @@ async function loadGraph(p) {
     Object.assign(S, { openApps: null, sideKey: null, lastMapId: null, trace: null, traceQ: '', strandOnly: null, shown: null, shownKey: null });
     S.src.clear();
   }
+  if (g.project !== S.p) { S.flows.clear(); S.descBusy.clear(); S.descFailed.clear(); S.descErr = null; }
   S.p = g.project;
   S.g = g; S.I = buildIndex(g);
+  await loadDescriptions();
   S.I.filesByApp = new Map(); g.files.forEach(f => S.I.filesByApp.set(f.app, (S.I.filesByApp.get(f.app) || 0) + 1));
   document.title = 'Wiretap · ' + g.name;
 }
@@ -1760,6 +2429,8 @@ function connect() {
       await loadProjects();
       if (!S.g) { await loadGraph(); await loadSession(null); }
       if (S.g) render();
+    } else if (msg.type === 'describe') {
+      if (msg.project === S.p) onDescribed(msg);
     } else if (msg.type === 'graph') {
       if (msg.project !== S.p) return;
       clearTimeout(graphTimer);

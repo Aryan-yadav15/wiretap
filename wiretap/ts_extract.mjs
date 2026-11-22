@@ -1,19 +1,25 @@
-// Extract functions, calls, HTTP calls, JSX renders and UI triggers from TS/TSX/JS files.
-// Input (stdin): {"typescript": "/abs/path/to/node_modules/typescript", "httpClients": ["api"], "files": [{"abs": "...", "rel": "..."}]}
+// Extract functions, calls, JSX renders and UI triggers from TS/TSX/JS files; adapters add routes, tables and HTTP calls.
+// Input (stdin): {"typescript": "/abs/path/to/node_modules/typescript", "httpClients": ["api"], "adapters": ["/abs/ts_x.mjs"],
+//                 "files": [{"abs": "...", "rel": "..."}]}
 // Output (stdout): JSON array, one entry per file. Name resolution across files happens in graph.py.
 
 import { createRequire } from 'node:module';
 import { readFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
+import { pathToFileURL } from 'node:url';
 
 const input = JSON.parse(readFileSync(0, 'utf8'));
 const require = createRequire(import.meta.url);
 const ts = require(input.typescript);
 const HTTP_CLIENTS = new Set(input.httpClients || ['api']);
-const HTTP_METHODS = new Set(['get', 'post', 'put', 'patch', 'delete', 'head', 'request']);
+const ADAPTERS = [];
+for (const p of input.adapters || []) ADAPTERS.push((await import(pathToFileURL(p).href)).default);
 const WRAPPERS = new Set(['useCallback', 'useMemo', 'memo', 'forwardRef', 'React.memo', 'React.forwardRef', 'React.useCallback', 'observer']);
 
 const hash = s => createHash('sha1').update(s).digest('hex').slice(0, 12);
+// OrderCard, App, KV: a capitalised identifier, but not a route handler (Next.js exports GET / POST, Express ones are "GET /x")
+const ROUTE_EXPORTS = new Set(['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS']);
+const isComponentName = n => /^[A-Z][A-Za-z0-9]*$/.test(n) && !ROUTE_EXPORTS.has(n);
 
 function kindFor(rel) {
   if (rel.endsWith('.tsx')) return ts.ScriptKind.TSX;
@@ -90,10 +96,23 @@ function extract(file) {
   const out = {
     lang: 'ts', rel: file.rel, imports: [], reexports: [], exports: {}, defaultExport: null,
     functions: [], calls: [], http: [], renders: [], triggers: [], consts: {}, destructured: [], tables: [], instances: {},
+    routes: [], routers: {}, includes: [], app_vars: [],
     lines: text.split('\n').length, error: null,
   };
   const fnNodes = new Map(); // node -> qual
   const fns = [];
+  const ctx = {
+    ts, sf, rel: file.rel, out, lineOf, dotted, urlParts, fnLike, httpClients: HTTP_CLIENTS, state: {},
+    register: (node, qual, parent, holder) => register(node, qual, parent, holder),
+    ownerOf: node => ownerOf(node), taken: qual => fns.some(f => f.name === qual), pending: () => fns,
+    add: (kind, rec, via) => { rec.via = via; out[kind].push(rec); },
+  };
+  const states = new Map(ADAPTERS.map(a => [a, {}]));
+  const hook = (name, ...args) => {
+    let claimed = false;
+    for (const a of ADAPTERS) if (a[name]) { ctx.state = states.get(a); if (a[name](ctx, ...args)) claimed = true; }
+    return claimed;
+  };
 
   // ---- imports / exports ----
   for (const st of sf.statements) {
@@ -108,6 +127,20 @@ function extract(file) {
         }
       }
       out.imports.push(imp);
+    } else if (ts.isVariableStatement(st)) {
+      for (const d of st.declarationList.declarations) {
+        const init = d.initializer;
+        if (!init || !ts.isCallExpression(init) || dotted(init.expression) !== 'require' || !init.arguments[0] || !ts.isStringLiteral(init.arguments[0])) continue;
+        const imp = { spec: init.arguments[0].text, names: [], def: null, ns: null };
+        if (ts.isIdentifier(d.name)) imp.def = d.name.text;
+        else if (ts.isObjectBindingPattern(d.name)) for (const el of d.name.elements) imp.names.push({ local: el.name.getText(sf), imported: el.propertyName ? el.propertyName.getText(sf) : el.name.getText(sf) });
+        out.imports.push(imp);
+      }
+    } else if (ts.isExpressionStatement(st) && ts.isBinaryExpression(st.expression) && st.expression.operatorToken.kind === ts.SyntaxKind.EqualsToken
+      && dotted(st.expression.left) === 'module.exports') {
+      const r = st.expression.right;
+      if (ts.isIdentifier(r)) out.defaultExport = r.text;
+      else if (ts.isObjectLiteralExpression(r)) for (const p of r.properties) if (ts.isShorthandPropertyAssignment(p)) out.exports[p.name.text] = p.name.text;
     } else if (ts.isExportDeclaration(st) && st.moduleSpecifier && ts.isStringLiteral(st.moduleSpecifier)) {
       const names = st.exportClause && ts.isNamedExports(st.exportClause)
         ? st.exportClause.elements.map(el => ({ local: el.name.text, imported: (el.propertyName || el.name).text }))
@@ -191,6 +224,7 @@ function extract(file) {
         }
         if (isExported(st)) out.exports[d.name.text] = d.name.text;
       }
+      hook('statement', st);
     } else if (ts.isClassDeclaration(st) && st.name) {
       const cls = st.name.text;
       if (isExported(st)) out.exports[cls] = cls;
@@ -244,33 +278,10 @@ function extract(file) {
       const callee = n.expression;
       const d = dotted(callee);
       const line = lineOf(n.getStart(sf));
-      if (from && d) {
+      if (d) {
         const parts = d.split('.');
-        const method = parts[parts.length - 1];
-        const obj = parts.slice(0, -1).join('.');
-        if (parts.length >= 2 && HTTP_CLIENTS.has(obj) && HTTP_METHODS.has(method)) {
-          const url = urlParts(n.arguments[0]);
-          out.http.push({ from, method: method.toUpperCase(), url, line });
-        } else if (d === 'fetch') {
-          let m = 'GET';
-          const opts = n.arguments[1];
-          if (opts && ts.isObjectLiteralExpression(opts)) {
-            for (const p of opts.properties) if (ts.isPropertyAssignment(p) && p.name.getText(sf) === 'method' && ts.isStringLiteral(p.initializer)) m = p.initializer.text.toUpperCase();
-          }
-          out.http.push({ from, method: m, url: urlParts(n.arguments[0]), line, fetch: true });
-        } else if ((method === 'from' || method === 'rpc') && /supabase/i.test(obj) && n.arguments[0] && ts.isStringLiteral(n.arguments[0])) {
-          // Direct database access from the client: supabase.from('orders').select(...)
-          let op = 'access';
-          for (let p = n.parent; p && ts.isPropertyAccessExpression(p); p = p.parent?.parent) {
-            if (['select'].includes(p.name.text)) op = 'read';
-            if (['insert', 'upsert', 'update', 'delete'].includes(p.name.text)) op = 'write';
-            if (!p.parent || !ts.isCallExpression(p.parent)) break;
-          }
-          const prefix = method === 'rpc' ? 'rpc:' : /storage$/i.test(obj) ? 'storage:' : '';
-          out.tables.push({ fn: from, table: prefix + n.arguments[0].text, op: method === 'rpc' ? 'call' : op, line });
-        } else {
-          out.calls.push({ from, target: d, line });
-        }
+        const c = { from, d, parts, method: parts[parts.length - 1], obj: parts.slice(0, -1).join('.'), line };
+        if (!hook('call', n, c) && from) out.calls.push({ from, target: d, line });
       }
       // Functions passed as callbacks: setTimeout(handleX), onSomething(handleX), arr.map(renderRow)
       if (from) for (const a of n.arguments) {
@@ -311,6 +322,7 @@ function extract(file) {
     ts.forEachChild(n, visitAll);
   };
   visitAll(sf);
+  hook('file');
 
   // Hash each function's own text, excluding nested functions, so an edit to a handler doesn't mark its parent changed.
   for (const rec of fns) {
@@ -319,7 +331,7 @@ function extract(file) {
     const base = node.getStart(sf);
     const kids = fns.filter(r => r.parent === rec.name).map(r => [r.holder.getStart(sf) - base, r.holder.end - base]).sort((a, b) => b[0] - a[0]);
     for (const [a, b] of kids) if (a >= 0 && b <= s.length) s = s.slice(0, a) + s.slice(b);
-    out.functions.push({ name: rec.name, line: rec.line, end: rec.end, parent: rec.parent, hash: hash(s), component: /^[A-Z]/.test(rec.name.split('.').pop()) });
+    out.functions.push({ name: rec.name, line: rec.line, end: rec.end, parent: rec.parent, hash: hash(s), component: isComponentName(rec.name.split('.').pop()) });
   }
   return out;
 }
@@ -327,6 +339,6 @@ function extract(file) {
 const results = [];
 for (const f of input.files) {
   try { results.push(extract(f)); }
-  catch (e) { results.push({ lang: 'ts', rel: f.rel, error: String(e && e.message || e), functions: [], calls: [], http: [], renders: [], triggers: [], imports: [], reexports: [], exports: {}, consts: {}, destructured: [], lines: 0 }); }
+  catch (e) { results.push({ lang: 'ts', rel: f.rel, error: String(e && e.message || e), functions: [], calls: [], http: [], renders: [], triggers: [], imports: [], reexports: [], exports: {}, consts: {}, destructured: [], tables: [], routes: [], routers: {}, includes: [], app_vars: [], lines: 0 }); }
 }
 process.stdout.write(JSON.stringify(results));

@@ -6,12 +6,14 @@ TypeScript is found in a node_modules folder; set WIRETAP_TYPESCRIPT=/path/to/no
 
 import json
 import os
+import re
 import shutil
 import sys
 import tempfile
 import threading
 import time
 import unittest
+import urllib.error
 import urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -20,6 +22,7 @@ sys.path.insert(0, os.path.dirname(HERE))
 from wiretap.graph import Project  # noqa: E402
 from wiretap.server import State, make_handler, term_regex  # noqa: E402
 from wiretap.session import parse_tests  # noqa: E402
+from wiretap.simplify import DescribeError, Describer, cut_steps, jobs_for  # noqa: E402
 from http.server import ThreadingHTTPServer  # noqa: E402
 
 
@@ -93,6 +96,107 @@ class TestGraph(FixtureCase):
         self.assertEqual(p2.build()["stats"]["edges"], g["stats"]["edges"])
 
 
+class TestStacks(unittest.TestCase):
+    """The adapters beyond FastAPI + Supabase: Express (CommonJS, mounted routers), Next.js and Expo-style
+    file routes, Flask blueprints, Prisma, and the coverage report. Fixture: tests/fixture-stacks."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="wiretap-stacks-")
+        self.root = os.path.join(self.tmp, "stacks")
+        shutil.copytree(os.path.join(HERE, "fixture-stacks"), self.root)
+        self.config = os.path.join(self.root, "wiretap.config.json")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def build(self, edit=None):
+        if edit:
+            with open(self.config) as fh:
+                cfg = json.load(fh)
+            edit(cfg)
+            with open(self.config, "w") as fh:
+                json.dump(cfg, fh)
+        p = Project(self.config)
+        p.scan()
+        return p.build()
+
+    def test_routes_from_every_adapter(self):
+        g = self.build()
+        routes = {n["id"]: n.get("fn") for n in g["nodes"] if n["kind"] == "route" and not n.get("missing")}
+        self.assertEqual(routes, {
+            # Express: router mounted with app.use('/api/orders', require(...)), a handler from another file, inline ones
+            "rt:express:GET /api/orders/{id}": "fn:express:src/controllers/orders.js#getOrder",
+            "rt:express:POST /api/orders": "fn:express:src/routes/orders.js#POST /",
+            "rt:express:GET /health": "fn:express:src/server.js#GET /health",
+            # Next.js: app router route.ts and a pages/api default export
+            "rt:next:GET /api/items/{id}": "fn:next:app/api/items/[id]/route.ts#GET",
+            "rt:next:DELETE /api/items/{id}": "fn:next:app/api/items/[id]/route.ts#DELETE",
+            "rt:next:ANY /api/health": "fn:next:pages/api/health.ts#handler",
+            # Flask: a blueprint with url_prefix, registered under /v1 inside create_app()
+            "rt:flask:GET /v1/orders/{order_id}": "fn:flask:app/views.py#order",
+            "rt:flask:DELETE /v1/orders/{order_id}": "fn:flask:app/views.py#order",
+            "rt:flask:GET /v1/orders/recent": "fn:flask:app/views.py#recent",
+        })
+        # an app with routes and no UI is a backend; Next.js (both) stays with the apps
+        self.assertEqual({a["id"]: a["kind"] for a in g["apps"]},
+                         {"express": "backend", "next": "client", "web": "client", "admin": "client", "flask": "backend"})
+        # Flask's sync views don't take FastAPI's worker threads
+        self.assertFalse([e for e in g["edges"] if e["k"] == "res" and e["s"].startswith("fn:flask:")])
+
+    def test_http_calls_reach_typescript_backends(self):
+        g = self.build()
+        http = {(e["s"], e["t"]) for e in g["edges"] if e["k"] == "http"}
+        self.assertIn(("fn:web:src/orders.ts#loadOrder", "fn:express:src/controllers/orders.js#getOrder"), http)
+        self.assertIn(("fn:web:src/orders.ts#placeOrder", "fn:express:src/routes/orders.js#POST /"), http)
+        # a Next.js page's fetch reaches its own app's routes, any-method ones too
+        self.assertIn(("fn:next:app/items/page.tsx#ItemsPage.remove", "fn:next:app/api/items/[id]/route.ts#DELETE"), http)
+        self.assertIn(("fn:next:app/items/page.tsx#ItemsPage.check", "fn:next:pages/api/health.ts#handler"), http)
+        self.assertEqual(g["stats"].get("http_unmatched", 0), 0)
+
+    def test_client_with_no_backend_set_uses_apps_with_routes(self):
+        def drop_backend(cfg):
+            for a in cfg["apps"]:
+                a.pop("backend", None)
+        g = self.build(drop_backend)
+        http = {(e["s"], e["t"]) for e in g["edges"] if e["k"] == "http"}
+        self.assertIn(("fn:web:src/orders.ts#loadOrder", "fn:express:src/controllers/orders.js#getOrder"), http)
+
+    def test_missing_path_prefix_is_worked_out(self):
+        g = self.build()
+        http = {(e["s"], e["t"]) for e in g["edges"] if e["k"] == "http"}
+        # admin calls /orders/{id}; Flask serves /v1/orders/{order_id}: with no pathPrefix set, /v1 is added
+        self.assertIn(("fn:admin:src/orders.ts#getOrder", "fn:flask:app/views.py#order"), http)
+        self.assertIn(("fn:admin:src/orders.ts#recentOrders", "fn:flask:app/views.py#recent"), http)
+        admin = next(a for a in g["coverage"]["apps"] if a["id"] == "admin")
+        self.assertEqual((admin["guessed_prefix"], admin["http"]["matched"]), ("/v1", 3))
+        # a config that sets pathPrefix (even to "") is taken as it is
+        def no_guess(cfg):
+            next(a for a in cfg["apps"] if a["id"] == "admin")["pathPrefix"] = ""
+        g = self.build(no_guess)
+        self.assertEqual(next(a for a in g["coverage"]["apps"] if a["id"] == "admin")["http"]["matched"], 0)
+
+    def test_prisma_tables_use_schema_names(self):
+        g = self.build()
+        E = {(e["s"], e["t"], e["k"]) for e in g["edges"]}
+        self.assertIn(("fn:express:src/controllers/orders.js#getOrder", "tb:prisma:orders", "read"), E)
+        self.assertIn(("fn:express:src/routes/orders.js#POST /", "tb:prisma:order_items", "write"), E)
+        self.assertIn(("fn:next:app/api/items/[id]/route.ts#DELETE", "tb:prisma:item", "write"), E)  # no schema: the model name
+
+    def test_coverage_names_what_it_read_and_what_it_did_not(self):
+        cov = self.build()["coverage"]
+        apps = {a["id"]: a for a in cov["apps"]}
+        self.assertEqual(apps["express"]["found"], {"routes": {"express": 3}, "tables": {"prisma": 3}})
+        self.assertEqual(apps["flask"]["found"]["routes"], {"flask": 3})
+        self.assertEqual(apps["web"]["http"], {"calls": 2, "matched": 2, "unmatched": 0, "unknown_url": 0})
+        self.assertEqual(cov["not_parsed"], [{"lang": "Go", "files": 1}])
+        self.assertEqual(cov["not_read"], [{"app": "next", "dep": "drizzle-orm", "what": "Drizzle queries"}])
+
+    def test_commonjs_imports(self):
+        g = self.build()
+        self.assertIn("f:express:src/routes/orders.js", g["imports"]["f:express:src/server.js"])
+        self.assertIn("f:express:src/controllers/orders.js", g["imports"]["f:express:src/routes/orders.js"])
+
+
 class TestHelpers(unittest.TestCase):
     def test_term_regex(self):
         rx = term_regex(["cod", "pay_later"])
@@ -101,9 +205,18 @@ class TestHelpers(unittest.TestCase):
         for s in ["code", "decode", "promo_code", "PROMO_CODE", "Codec"]:
             self.assertFalse(rx.search(s), s)
 
+    def test_outbound_http_needs_a_url(self):
+        from wiretap.py_extract import extract
+        src = 'import requests\ndef f(x):\n    x.get("http_out", [])\n    return requests.get("https://api.stripe.com/v1/charges")\n'
+        hosts = [h["host"] for h in extract(src, "a.py", "a").get("http_out", [])]
+        self.assertEqual(hosts, ["api.stripe.com"])  # the dict lookup is not a web request
+
     def test_parse_tests(self):
         self.assertEqual(parse_tests("==== 1 failed, 212 passed in 3.2s ===="), {"passed": 212, "failed": 1})
         self.assertEqual(parse_tests("Tests:       2 failed, 40 passed, 42 total"), {"passed": 40, "failed": 2})
+        self.assertEqual(parse_tests("....\n94 passed, 2 deselected in 0.99s"), {"passed": 94, "failed": 0})
+        self.assertEqual(parse_tests("ℹ tests 3\nℹ pass 2\nℹ fail 1\nℹ cancelled 0"), {"passed": 2, "failed": 1})
+        self.assertEqual(parse_tests("ℹ fail 0\nℹ cancelled 0\nℹ skipped 0"), {"passed": None, "failed": 0})
         self.assertIsNone(parse_tests("hello"))
 
 
@@ -173,6 +286,57 @@ class TestLiveSession(FixtureCase):
         self.assertIn("f:api:app/database.py", ed.touched)
         self.assertEqual(ed.touched["f:api:app/database.py"]["fns"], {"close_db": "added"})
 
+    def test_handback_transcript_prompt_and_shell_kinds(self):
+        state = State(self.config)
+        transcript = os.path.join(self.tmp, "t.jsonl")
+        with open(transcript, "w") as fh:
+            for msg in [{"type": "user", "message": {"role": "user", "content": "Cap the pay later fee"}},
+                        {"type": "user", "message": {"role": "user", "content": [{"type": "tool_result", "content": "ok"}]}},
+                        {"type": "user", "message": {"role": "user", "content": "<agent-message from=\"a1\">report</agent-message>"}}]:
+                fh.write(json.dumps(msg) + "\n")
+        pricing = os.path.join(self.root, "backend/app/services/pricing.py")
+        # Wiretap missed the prompt, so the first tool call reads it from the transcript
+        self.hook(state, hook_event_name="PostToolUse", tool_name="Read", tool_input={"file_path": pricing}, transcript_path=transcript)
+        self.hook(state, hook_event_name="Stop")
+        self.hook(state, hook_event_name="UserPromptSubmit",
+                  prompt='Another Claude session sent a message:\n<agent-message from="a1">\n[Subagent hand-back] Done: fee capped.\n</agent-message>')
+        # writing a test file is not running the tests; pytest -q's summary is read; a commit is not a search
+        self.hook(state, hook_event_name="PostToolUse", tool_name="Bash",
+                  tool_input={"command": "cat > tests/test_cap.py <<'EOF'\nimport pytest\nEOF"}, tool_response={"stdout": ""})
+        self.hook(state, hook_event_name="PostToolUse", tool_name="Bash", tool_input={"command": "uv run pytest -q 2>&1 | tail -1"},
+                  tool_response={"stdout": "94 passed, 2 deselected in 0.99s"})
+        self.hook(state, hook_event_name="PostToolUse", tool_name="Bash", tool_input={"command": "git add -A && git commit -q -m cap"},
+                  tool_response={"stdout": " app/services/pricing.py | 2 +-"})
+        tasks = state.sessions.snapshot(state.sessions.by_id["s1"], state.index)["tasks"]
+        self.assertEqual(len(tasks), 1)
+        t = tasks[0]
+        self.assertEqual(t["prompt"], "Cap the pay later fee")
+        self.assertIsNone(t["ended"])
+        kinds = [e["k"] for e in t["events"]]
+        self.assertEqual(kinds, ["read", "stop", "handback", "run", "test", "run"])
+        self.assertEqual(t["events"][2]["text"], "Done: fee capped.")
+        self.assertEqual(t["tests"]["passed"], 94)
+
+    def test_stray_edit_and_imports(self):
+        state = State(self.config)
+        imports = state.graph["imports"]
+        self.assertIn("f:web:src/services/api.ts", imports["f:web:src/pages/Checkout.tsx"])
+        self.hook(state, hook_event_name="UserPromptSubmit", prompt="Cap the fee")
+        self.edit(state, "backend/app/services/pricing.py", 'return row.data[0]["amount"]', 'return min(50, row.data[0]["amount"])')
+        self.edit(state, "backend/app/routers/orders.py", 'return row\n', 'return {"row": row, "total": total}\n')
+        path = os.path.join(self.root, "backend/app/services/banner.py")
+        with open(path, "w") as fh:
+            fh.write("def banner():\n    return 'hi'\n")
+        self.hook(state, hook_event_name="PostToolUse", tool_name="Write", tool_input={"file_path": path, "content": "x\n"})
+        pkg = os.path.join(self.root, "backend/app/services/extra/__init__.py")
+        os.makedirs(os.path.dirname(pkg))
+        open(pkg, "w").close()
+        self.hook(state, hook_event_name="PostToolUse", tool_name="Write", tool_input={"file_path": pkg, "content": ""})
+        t = state.sessions.snapshot(state.sessions.by_id["s1"], state.index)["tasks"][-1]
+        # pricing and orders are linked by a call; the new banner file links to nothing else that changed,
+        # and an empty package marker is never flagged
+        self.assertEqual(t["summary"]["stray"], ["f:api:app/services/banner.py"])
+
 
 class TestProjects(FixtureCase):
     """A Claude session in a folder with no config gets that folder mapped on its own."""
@@ -200,6 +364,103 @@ class TestProjects(FixtureCase):
             self.assertIn("c1", state.sessions.by_id)
         finally:
             shutil.rmtree(state.projects["wt-other-proj"].project.cache_dir, ignore_errors=True)
+
+
+def listed(prompt):
+    """Function names a describe prompt asks for ("- name: 10-24")."""
+    return re.findall(r"^- (\S+): \d+-\d+$", prompt, re.M)
+
+
+class FakeModel:
+    """Stands in for claude -p: names every listed function, plus one the parser never found."""
+
+    def __init__(self, steps=None):
+        self.calls, self.steps = [], steps
+
+    def __call__(self, prompt, stdin):
+        self.calls.append(prompt)
+        if prompt.startswith("Below are the steps"):
+            n = int(re.search(r"exactly (\d+) names", prompt).group(1)) if self.steps is None else self.steps
+            return json.dumps({"title": "Customer places an order", "steps": [f"Step {i + 1}" for i in range(n)]})
+        fns = {n: {"name": f"Does {n}", "line": f"Explains {n}."} for n in listed(prompt)}
+        fns["made_up_function"] = {"name": "Invented", "line": "Not in the file."}
+        return "Sure, here it is:\n" + json.dumps({"file": {"name": "Order pricing", "line": "Works out totals."}, "functions": fns})
+
+
+class TestSimplify(FixtureCase):
+    """Simple mode (ADR 0006): the model names what the parser found and nothing else; names are cached by hash."""
+
+    def test_describe_file_drops_invented_names_and_caches_by_hash(self):
+        p, g = self.build()
+        model = FakeModel()
+        d = Describer(p.cache_dir, run=model)
+        fid = next(f["id"] for f in g["files"] if f["rel"].endswith("pricing.py"))
+        def text_of(f):
+            with open(os.path.join(self.root, "backend", f.split(":", 2)[2])) as fh:
+                return fh.read().splitlines()
+        jobs = jobs_for(g, [fid], text_of, {}, d)
+        self.assertEqual(len(jobs), 1)
+        res = d.describe_file(jobs[0])
+        fns = [f for f in g["fns"] if f["file"] == fid]
+        self.assertTrue(fns)
+        self.assertEqual(set(res["fns"]), {f["id"] for f in fns})  # made_up_function is not on the map
+        self.assertEqual(res["files"][fid]["n"], "Order pricing")
+        # fresh, and kept on disk
+        self.assertEqual(jobs_for(g, [fid], text_of, {}, d), [])
+        again = Describer(p.cache_dir, run=model).fresh(g)
+        self.assertEqual(again["fns"][fns[0]["id"]]["n"], f"Does {fns[0]['name']}")
+        # a changed function is stale again, and only its description stops being served
+        g["fns"] = [{**f, "hash": "changed"} if f["id"] == fns[0]["id"] else f for f in g["fns"]]
+        self.assertNotIn(fns[0]["id"], d.fresh(g)["fns"])
+        jobs = jobs_for(g, [fid], text_of, {}, d)
+        self.assertEqual(len(jobs), 1)
+        # only the changed function is asked for again; the others keep their names
+        d.describe_file(jobs[0])
+        self.assertEqual(listed(model.calls[-1]), [fns[0]["name"]])
+        self.assertEqual(len(d.fresh(g)["fns"]), len(fns))
+
+    def test_a_file_with_many_functions_is_split_across_calls(self):
+        model = FakeModel()
+        d = Describer(self.tmp, run=model)
+        fi = {"id": "f:a:big.py", "rel": "big.py", "label": "big.py", "lines": 900, "app": "a"}
+        fns = [{"id": f"fn:a:big.py#f{i}", "name": f"f{i}", "line": i * 10, "end": i * 10 + 5, "hash": str(i), "file": fi["id"]} for i in range(45)]
+        res = d.describe_file({"file": fi, "fns": fns, "lines": ["pass"] * 900, "where": "a · big.py"})
+        self.assertEqual(len(model.calls), 3)  # 20 + 20 + 5
+        self.assertEqual(len(res["fns"]), 45)
+
+    def test_flow_steps_are_cut_by_layer_and_must_all_be_named(self):
+        items = [{"id": "tg:1", "layer": "start"}, {"id": "fn:a", "layer": "screen"}, {"id": "fn:b", "layer": "client"},
+                 {"id": "fn:c", "layer": "client"}, {"id": "rt:x", "layer": "route"}, {"id": "fn:d", "layer": "logic"}]
+        steps = cut_steps(items)
+        self.assertEqual([[i["id"] for i in st["items"]] for st in steps], [["tg:1"], ["fn:a"], ["fn:b", "fn:c"], ["rt:x"], ["fn:d"]])
+        for st in steps:
+            for it in st["items"]:
+                it["label"] = it["id"]
+        d = Describer(self.tmp, run=FakeModel(steps=3))
+        with self.assertRaises(DescribeError):
+            d.flow(steps)
+        model = FakeModel()
+        d = Describer(self.tmp, run=model)
+        self.assertEqual(d.flow(steps)["steps"], ["Step 1", "Step 2", "Step 3", "Step 4", "Step 5"])
+        d.flow(steps)
+        self.assertEqual(len(model.calls), 1)  # cached
+
+    def test_server_names_a_flow_and_describes_its_files(self):
+        state = State(self.config)
+        ps = state.primary
+        model = FakeModel()
+        ps.describer.run = model
+        g = ps.graph
+        route = next(n for n in g["nodes"] if n["kind"] == "route" and n["label"] == "POST /api/orders")
+        handler = route["fn"]
+        callee = next((e["t"] for e in g["edges"] if e["s"] == handler and e["k"] == "call" and e["t"].startswith("fn:")), None)
+        ids = [route["id"]] + [i for i in (handler, callee) if i]
+        res = ps.flow(ids)
+        self.assertNotIn("error", res, res)
+        self.assertEqual(res["title"], "Customer places an order")
+        self.assertEqual(sum(len(st["ids"]) for st in res["steps"]), len(ids))  # every function is in a step
+        self.assertEqual(res["steps"][0]["layer"], "route")
+        self.assertTrue(state.primary.describer.fresh(g)["fns"])  # the flow's files were described on the way
 
 
 class StyleTest(unittest.TestCase):
@@ -239,6 +500,20 @@ class TestHttp(FixtureCase):
             self.assertEqual(src["lines"][0], "def compute_total(items, method=None):")
             tr = json.load(urllib.request.urlopen(base + "/api/search?q=cod"))
             self.assertTrue(any(h["id"].endswith("#pay_later_fee") for h in tr["hits"]))
+        finally:
+            srv.shutdown()
+
+    def test_serves_the_layout_script_and_nothing_outside_web(self):
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(State(self.config)))
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        base = f"http://127.0.0.1:{srv.server_address[1]}"
+        try:
+            r = urllib.request.urlopen(base + "/web/vendor/elk/elk-api.js")
+            self.assertIn("javascript", r.headers["Content-Type"])
+            for bad in ["/web/../wiretap/server.py", "/web/%2e%2e/wiretap/server.py", "/web/vendor/elk/LICENSE.md"]:
+                with self.assertRaises(urllib.error.HTTPError, msg=bad) as e:
+                    urllib.request.urlopen(base + bad)
+                self.assertEqual(e.exception.code, 404)
         finally:
             srv.shutdown()
 

@@ -7,13 +7,15 @@ Wiretap is one local Python process. It parses a project's Python and TypeScript
 | Component | Responsibility | Code |
 |---|---|---|
 | CLI | `serve`, `index`, `install-hooks`, `uninstall-hooks` | [`wiretap/__main__.py`](../wiretap/__main__.py) |
-| Python parser | functions, calls, imports, FastAPI routes and router prefixes, Supabase / SQLAlchemy table use, thread-pool and background-task use | [`wiretap/py_extract.py`](../wiretap/py_extract.py) |
-| TypeScript parser | functions, components, handlers, `api.get/post` and `fetch` URLs, JSX `onClick` / `onPress`, renders, direct Supabase calls | [`wiretap/ts_extract.mjs`](../wiretap/ts_extract.mjs) |
+| Python parser | functions, calls, imports; runs the Python adapters | [`wiretap/py_extract.py`](../wiretap/py_extract.py) |
+| TypeScript parser | functions, components, handlers, imports (ES and CommonJS), JSX `onClick` / `onPress`, renders; runs the TypeScript adapters | [`wiretap/ts_extract.mjs`](../wiretap/ts_extract.mjs) |
+| Adapters | one per framework or library: routes, router prefixes and mounts, table use, HTTP calls, jobs | [`wiretap/adapters/`](../wiretap/adapters/), [adapters.md](adapters.md) |
+| Coverage | per app, what each adapter found and how many API calls matched; other languages and unread libraries | [`wiretap/coverage.py`](../wiretap/coverage.py) |
 | Stylesheet reader | each CSS / SCSS / Less rule as a "function" named by its selector, so edits are reported per rule; HTML files listed | [`wiretap/style_extract.py`](../wiretap/style_extract.py) |
 | Project + linker | which files to read, the extraction cache, and linking: imports, HTTP calls to routes, tables, resources, where flows start; `autodetect` for a folder with no config | [`wiretap/graph.py`](../wiretap/graph.py) |
 | Sessions | turns hook events into a timeline: reads (including shell `grep` / `sed`), plan, function-level diffs, tests | [`wiretap/session.py`](../wiretap/session.py) |
 | Server | HTTP + server-sent events, file watcher, hook queue routed to the right project, feature-trace search, optional summary. `State` holds every project; one `ProjectState` per project holds its graph and sessions | [`wiretap/server.py`](../wiretap/server.py) |
-| UI | System, Map, Inside a file, Live, Trace, Resources views, a project sidebar, a canvas you can pan, zoom and rearrange; plain JS + SVG, no build step | [`web/`](../web/) |
+| UI | System, Folders, Map, Inside a file, Live, Trace, Resources views, a project sidebar, a canvas you can pan, zoom and rearrange; plain JS + SVG, no build step; Map and Folders laid out by ELK (copied into `web/vendor/elk`) | [`web/`](../web/) |
 | Terminal button | a Claude Code mod: "◉ Wiretap live ↗" above the prompt and `/wiretap` | [`claude-mod/wiretap-live/`](../claude-mod/wiretap-live/) |
 
 ## How they communicate
@@ -54,10 +56,13 @@ Wiretap is one local Python process. It parses a project's Python and TypeScript
 
 ## What the parsers understand
 
-- **Python / FastAPI**: functions, methods and nested functions; imports (including relative ones); `APIRouter(prefix=…)` and `include_router(…, prefix=…)` chains; route decorators; Supabase `.table("x").select/insert/update/…` (read vs write) and `.rpc()`; SQLAlchemy models via `__tablename__`; `run_in_threadpool`, `asyncio.to_thread`, sync `def` endpoints (these use the thread pool too); `on_event("startup")`, `create_task`, `add_job`, `BackgroundTasks.add_task`; outside SDKs (Razorpay, Firebase, …) and HTTP calls to known hosts.
+What follows is the core plus the adapters that ship; [adapters.md](adapters.md) lists them all.
+
+- **Python / FastAPI / Flask**: functions, methods and nested functions; imports (including relative ones); `APIRouter(prefix=…)` and `include_router(…, prefix=…)` chains; route decorators; Flask `@app.route`, blueprints and `register_blueprint(…, url_prefix=…)`; Supabase `.table("x").select/insert/update/…` (read vs write) and `.rpc()`; SQLAlchemy models via `__tablename__`; `run_in_threadpool`, `asyncio.to_thread`, sync `def` endpoints (these use the thread pool too); `on_event("startup")`, `create_task`, `add_job`, `BackgroundTasks.add_task`; outside SDKs (Razorpay, Firebase, …) and HTTP calls to known hosts.
 - **TypeScript / React / React Native**: functions, components, handlers nested in components, object-of-functions exports (`admin.getZones`), class instances (`orderService.getMyOrders`), re-exports, `@/` aliases; `api.get/post/…` and `fetch` calls with URLs from literals, template strings and constants like `API_ENDPOINTS.X(id)`; JSX `onClick` / `onPress` handlers (with the button text); `<Component/>` renders; direct `supabase.from("table")` calls; hooks like `const { addItem } = useCart()` (marked as a guess).
+- **TypeScript / JavaScript backends**: Express, Fastify and Hono routes (`app.get('/x/:id', handler)`, routers mounted with `app.use('/api', router)`, handlers imported from other files, CommonJS `require` / `module.exports`); Next.js `app/**/route.ts` and `pages/api/**` routes and Expo Router `+api.ts`; Prisma queries, with table names from `schema.prisma`.
 - **Stylesheets** (`.css`, `.scss`, `.sass`, `.less`) in a TypeScript app: every rule, named by its selector, with `@media` / `@supports` parents in the name and each `@keyframes` as one rule. They aren't linked to the components that use them.
-- Each API call in an app is matched to its backend route (method + path, `{param}` aware). Calls that hit no route are listed under System.
+- Each API call in an app is matched to its backend route (method + path, `{param}` aware). An app with no `backend` set is matched against every app that has routes, its own included (Next.js). With no `pathPrefix` set, a prefix most of its calls leave out (`/api/v1`) is worked out and reported. Calls that hit no route are listed under System.
 
 ## Key decisions
 
@@ -65,6 +70,9 @@ Wiretap is one local Python process. It parses a project's Python and TypeScript
 - **Read code, don't run it.** No app has to start; a cold index of a 638-file, six-app project took 1.7 s. ([ADR 0002](decisions/0002-static-parsing.md))
 - **Function-level diffs.** Each function's body is hashed at parse time, so edits are reported per function and their callers can be traced. ([ADR 0003](decisions/0003-function-level-diffs.md))
 - **Questions drawn as flows.** When Claude only reads, Live draws one row per flow it followed, instead of a file graph. ([ADR 0004](decisions/0004-question-mode-strands.md))
+- **One adapter per framework, and say what wasn't read.** Framework rules live in small adapter files; a coverage report names what was found and what wasn't. ([ADR 0005](decisions/0005-adapters-and-coverage.md))
+- **Layout from the links.** ELK puts a caller left of what it calls and keeps lines from crossing; an app is browsed a folder at a time. ([ADR 0007](decisions/0007-layered-layout.md))
+- **Plain English on top, never instead.** Simple mode asks `claude -p` to name files, functions and flow steps, caches each name against the function's hash, and never lets the model add or move a link. ([ADR 0006](decisions/0006-simplify-layer.md))
 
 ## Known limits
 

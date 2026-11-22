@@ -12,10 +12,13 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
 from .graph import Project, autodetect
+from .coverage import lines as coverage_lines
 from .session import Sessions
+from .simplify import DescribeError, Describer, cut_steps, jobs_for, layer_of
 
 WEB = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "web")
 CALL_KINDS = {"call", "http", "renders"}
+MAX_DESCRIBE = 24  # files queued per request, in the order given (what's in focus first)
 
 
 class GraphIndex:
@@ -24,9 +27,23 @@ class GraphIndex:
     def __init__(self, g):
         self.callers = defaultdict(set)
         self.fn_file = {f["id"]: f["file"] for f in g["fns"]}
+        node_file = {n["id"]: n.get("file") for n in g["nodes"]}
+        # files next to each other: a call either way, an import, or a table both use (tables are their own nodes)
+        self.near = defaultdict(set)
         for e in g["edges"]:
             if e["k"] in CALL_KINDS:
                 self.callers[e["t"]].add(e["s"])
+            if e["k"] in ("trig", "res", "ext"):
+                continue
+            a = self.fn_file.get(e["s"]) or node_file.get(e["s"])
+            b = e["t"] if e["t"].startswith("tb:") else self.fn_file.get(e["t"]) or node_file.get(e["t"])
+            if a and b and a != b:
+                self.near[a].add(b)
+                self.near[b].add(a)
+        for a, targets in g.get("imports", {}).items():
+            for b in targets:
+                self.near[a].add(b)
+                self.near[b].add(a)
 
     def upstream(self, fn_ids, depth=3, exclude_files=()):
         seen, frontier = set(fn_ids), set(fn_ids)
@@ -38,6 +55,26 @@ class GraphIndex:
             frontier = nxt
         fns = {f for f in seen - set(fn_ids) if self.fn_file.get(f) not in exclude_files}
         return fns, {self.fn_file[f] for f in fns if f in self.fn_file}
+
+    def stray(self, files, depth=2):
+        """Changed files with no call, import or shared table linking them to any other changed file
+        within `depth` hops: usually edits unrelated to the rest of the change."""
+        # a package marker (__init__.py) is needed without anything calling into it
+        files = {f for f in files if not f.endswith("/__init__.py")}
+        if len(files) < 2:
+            return set()
+        out = set()
+        for f in files:
+            seen, frontier, linked = {f}, {f}, False
+            for _ in range(depth):
+                frontier = {n for x in frontier for n in self.near.get(x, ())} - seen
+                if frontier & (files - {f}):
+                    linked = True
+                    break
+                seen |= frontier
+            if not linked:
+                out.add(f)
+        return out
 
 
 TOOL = os.path.dirname(WEB)
@@ -61,6 +98,7 @@ class ProjectState:
         self.graph_json = json.dumps(self.graph, separators=(",", ":")).encode()
         self.sessions = Sessions(self.project)
         self.text_cache = {}
+        self.describer = Describer(self.project.cache_dir)
 
     def _build(self):
         g = self.project.build()
@@ -235,6 +273,56 @@ class ProjectState:
         return {"text": proc.stdout.strip()}
 
 
+    # ---- plain English (ADR 0006): the parser owns the structure, a model only names it ----
+    def _apps(self):
+        return {a["id"]: a["name"] for a in self.graph["apps"]}
+
+    def _pushed(self, fid, res, err):
+        msg = {"type": "describe", "project": self.id, "file": fid}
+        msg.update(res or {"error": err})
+        self.hub.broadcast(msg)
+
+    def describe(self, file_ids):
+        """Queue files for a description; each one is pushed over SSE when it lands."""
+        with self.lock:
+            jobs = jobs_for(self.graph, list(dict.fromkeys(file_ids))[:MAX_DESCRIBE], self.file_text, self._apps(), self.describer)
+        return {"queued": self.describer.describe_async(jobs, self._pushed)}
+
+    def flow(self, ids):
+        """Name a flow: steps are cut where the layer changes, then one call names them."""
+        with self.lock:
+            g = self.graph
+            role = {f["id"]: f["role"] for f in g["files"]}
+            fns = {f["id"]: f for f in g["fns"]}
+            nodes = {n["id"]: n for n in g["nodes"]}
+            items = []
+            for nid in ids:
+                if nid in fns:
+                    f = fns[nid]
+                    items.append({"id": nid, "layer": layer_of(nid, role.get(f["file"]), None), "file": f["file"], "raw": f["name"], "hash": f["hash"]})
+                elif nid in nodes:
+                    n = nodes[nid]
+                    items.append({"id": nid, "layer": layer_of(nid, None, n.get("kind")), "label": n.get("label") or nid, "hash": ""})
+            files = list(dict.fromkeys(it["file"] for it in items if "file" in it))
+            jobs = jobs_for(g, files[:MAX_DESCRIBE], self.file_text, self._apps(), self.describer)
+        if not items:
+            return {"error": "Nothing in this flow is on the map."}
+        try:
+            for job in jobs:  # outside the lock: a model call takes seconds
+                self._pushed(job["file"]["id"], self.describer.describe_file(job), None)
+            known = self.describer.fresh(self.graph)["fns"]
+            for it in items:
+                if "file" in it:
+                    d = known.get(it["id"])
+                    it["label"], it["line"] = (d["n"], d["t"]) if d else (it["raw"], "")
+            steps = cut_steps(items)
+            named = self.describer.flow(steps)
+        except DescribeError as e:
+            return {"error": str(e)}
+        return {"title": named["title"], "steps": [{"name": nm, "layer": st["layer"], "ids": [it["id"] for it in st["items"]]}
+                                                   for nm, st in zip(named["steps"], steps)]}
+
+
 class State:
     """Every project Wiretap maps. The one from the config file comes first; a Claude Code session in any other
     folder gets that folder mapped on its first hook (see graph.autodetect)."""
@@ -282,6 +370,7 @@ class State:
         ps = self.add(Project(cfg=cfg, cache_dir=os.path.join(TOOL, ".wiretap-cache", "auto", pid)), auto=True, note=note)
         st = ps.graph["stats"]
         print(f"Mapped {root}: {st['files']} files, {st['functions']} functions in {time.time() - t0:.1f}s" + (f" ({note})" if note else ""))
+        print("\n".join(coverage_lines(ps.graph["coverage"])))
         self.broadcast({"type": "projects"})
         return ps
 
@@ -373,11 +462,13 @@ def make_handler(state):
             q = parse_qs(u.query)
             path = u.path
             if path == "/" or path.startswith("/web/") or path in ("/app.js", "/style.css"):
-                name = "index.html" if path == "/" else os.path.basename(path)
-                fp = os.path.join(WEB, name)
-                if not os.path.isfile(fp):
+                name = "index.html" if path == "/" else path[len("/web/"):] if path.startswith("/web/") else path[1:]
+                fp = os.path.normpath(os.path.join(WEB, name))
+                ctype = {"html": "text/html", "js": "text/javascript", "css": "text/css"}.get(name.rsplit(".", 1)[-1])
+                # web/ and its folders (vendor/elk) only, never a path that climbs out
+                if not ctype or not fp.startswith(WEB + os.sep) or not os.path.isfile(fp):
                     return self._send(404, {"error": "not found"})
-                ctype = {"html": "text/html", "js": "text/javascript", "css": "text/css"}[name.rsplit(".", 1)[1]] + "; charset=utf-8"
+                ctype += "; charset=utf-8"
                 with open(fp, "rb") as fh:
                     return self._send(200, fh.read(), ctype)
             pid = (q.get("p") or [None])[0]
@@ -415,6 +506,10 @@ def make_handler(state):
                     return self._send(404, {"error": "file not found"})
                 end = min(end, start + 400, len(lines))
                 return self._send(200, {"file": fid, "start": start, "lines": lines[start - 1:end]})
+            if path == "/api/describe":
+                with state.lock:
+                    ps = state.get(pid)
+                    return self._send(200, ps.describer.fresh(ps.graph) if ps else {"fns": {}, "files": {}})
             if path == "/api/search":
                 terms = re.split(r"[,\n]", (q.get("q") or [""])[0])
                 with state.lock:
@@ -463,6 +558,13 @@ def make_handler(state):
                 if not ps:
                     return self._send(200, {"error": "No such session"})
                 return self._send(200, ps.summarize(body.get("session"), body.get("task")))
+            if u.path in ("/api/describe", "/api/flow"):
+                ps = state.get(body.get("p"))
+                if not ps:
+                    return self._send(200, {"error": "No project is mapped yet."})
+                if u.path == "/api/describe":
+                    return self._send(200, ps.describe([f for f in body.get("files") or [] if isinstance(f, str)]))
+                return self._send(200, ps.flow([i for i in body.get("ids") or [] if isinstance(i, str)][:40]))
             return self._send(404, {"error": "not found"})
 
     return H
@@ -488,6 +590,7 @@ def serve(config, port=None, host="127.0.0.1"):
     if state.primary:
         st = state.graph["stats"]
         print(f"Wiretap: {st['files']} files, {st['functions']} functions, {st['edges']} links indexed in {time.time() - t0:.1f}s")
+        print("\n".join(coverage_lines(state.graph["coverage"])))
     else:
         print("Wiretap: no config, so it maps whichever project Claude Code works in")
     print(f"Open http://{host}:{port}")

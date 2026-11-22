@@ -174,6 +174,8 @@ body.resizing { user-select: none; cursor: grabbing }
 .stepper.fold .stepper-h { cursor: pointer; user-select: none }
 .stepper.fold.shut .steps { display: none }
 .stepper.fold.shut .stepper-h { margin-bottom: 0 }
+.fold-hint::after { content: "hide ▾"; color: var(--muted); text-decoration: underline }
+.stepper.fold.shut .fold-hint::after { content: "show every step ▸" }
 .legend { display: flex; flex-wrap: wrap; gap: 6px 16px; padding: 9px 12px; font-size: 11.5px; color: var(--muted); border-top: 1.5px dashed var(--line); background: color-mix(in srgb, var(--paper) 85%, transparent) }
 .legend i { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 6px; vertical-align: 0; box-shadow: 0 0 0 1.5px var(--paper), 0 0 0 2.5px currentColor }
 .empty { padding: 48px 28px; color: var(--muted); max-width: 640px }
@@ -216,6 +218,11 @@ body.resizing { user-select: none; cursor: grabbing }
 .edge.new { stroke: var(--down); stroke-width: 2 }
 .edge.warn { stroke: var(--warn); stroke-width: 2 }
 .edge.faint { opacity: .45 }
+.edge.imp { stroke-dasharray: 3 4; opacity: .55 }
+.grp rect { fill: var(--lane); stroke: var(--rule); stroke-width: 1.2; stroke-dasharray: 5 4; cursor: pointer }
+.grp text { font: 600 10.5px var(--mono); fill: var(--ink); cursor: pointer }
+.grp:hover rect { fill: var(--hl) }
+.linkbtn { font: inherit; color: inherit; background: none; border: 0; padding: 0; text-decoration: underline; cursor: pointer }
 .hit { fill: none; stroke: transparent; stroke-width: 12; cursor: pointer; pointer-events: stroke }
 .edge.hov { stroke-width: 3.4 }
 .el rect { fill: var(--panel); stroke: var(--rule); stroke-width: 1.2 }
@@ -344,3 +351,62 @@ pre.src span.ln { display: inline-block; width: 44px; padding-right: 10px; text-
 .node.appear rect.box { animation: flash 1.6s ease-out }
 @keyframes flash { from { fill: var(--hl) } }
 @media (prefers-reduced-motion: reduce) { .node.appear, .node.appear rect.box { animation: none } .btn, .btn2 { transition: none } }
+/* Simple mode (ADR 0006): plain-English names written by a model, marked as such */
+.pill.ai { background: var(--ghost-soft); border-color: var(--ghost); color: var(--ink) }
+.ai-note { display: flex; gap: 8px; align-items: baseline; margin-top: 8px; font-size: 12.5px; line-height: 1.45 }
+.flow-title { font-weight: 600; margin-bottom: 6px }
+ol.flow { margin: 0; padding-left: 20px; display: grid; gap: 6px; font-size: 12.5px }
+ol.flow b { display: block }
+ol.flow .r { display: block; color: var(--muted); font: 11px var(--mono); word-break: break-word }
+.desc-st { font-size: 11.5px; color: var(--muted); background: var(--panel); border: 1.5px solid var(--rule); border-radius: 8px; padding: 6px 9px; box-shadow: var(--sh) }
+.desc-st.err { color: var(--warn); border-color: var(--warn) }
+.cv-tools .grp.seg { padding: 2px; gap: 2px }
+.cv-tools .grp.seg button { font-size: 12px; height: 24px; padding: 0 9px; border-radius: 6px; background: none; color: var(--muted) }
+.cv-tools .grp.seg button[aria-pressed="true"] { background: var(--accent-soft); color: var(--ink) }
+.cv-tools .grp.seg button[data-a="simple"][aria-pressed="true"] { background: var(--ghost-soft) }
+.muted { color: var(--muted) }
+.row.more rect { fill: var(--lane); stroke-dasharray: 4 3 } .row.more .t { fill: var(--muted) }
+/* Simple mode progress: the pill, boxes waiting for a name (pulse), boxes just named (flash once) */
+@keyframes wt-pulse { 0%, 100% { opacity: 1 } 50% { opacity: .4 } }
+@keyframes wt-named { from { fill: var(--ghost-soft); stroke: var(--ghost) } }
+.desc-st.busy { color: var(--ink); background: var(--ghost-soft); border-color: var(--ghost); font-weight: 600; display: inline-flex; align-items: center; gap: 7px }
+.desc-st.done { color: var(--ink); border-color: var(--ghost) }
+.desc-st .spin { width: 8px; height: 8px; border-radius: 50%; background: var(--ghost); box-shadow: 0 0 0 3px color-mix(in srgb, var(--ghost) 25%, transparent); animation: wt-pulse .9s ease-in-out infinite }
+.node.describing rect.box, .row.describing rect { stroke: var(--ghost); stroke-dasharray: 6 4; animation: wt-pulse 1.2s ease-in-out infinite }
+.cont-s.describing { fill: var(--ghost); font-weight: 600; animation: wt-pulse 1.2s ease-in-out infinite }
+.node.named rect.box, .row.named rect { animation: wt-named 1.4s ease-out }
+@media (prefers-reduced-motion: reduce) {
+  .desc-st .spin, .node.describing rect.box, .row.describing rect, .cont-s.describing, .node.named rect.box, .row.named rect { animation: none }
+}
+
+/* ---------- Map and Folders, laid out by ELK (docs/decisions/0007-layered-layout.md) ---------- */
+/* what a line carries; built from the theme's colours, so dark mode follows */
+:root { --k-call: color-mix(in srgb, var(--muted) 75%, var(--line)); --k-http: var(--app5); --k-data: var(--ghost); --k-ui: var(--app4); --k-out: var(--rule) }
+.flowg .edge { stroke-width: var(--sw, 1.6px); transition: opacity .2s, stroke-width .2s }
+.flowg .edge.hov, .flowg .edge.hl { stroke-width: calc(var(--sw, 1.6px) + 1.4px) }
+.edge.k-call { stroke: var(--k-call) } .edge.k-http { stroke: var(--k-http) } .edge.k-data { stroke: var(--k-data) }
+.edge.k-ui { stroke: var(--k-ui) } .edge.k-out { stroke: var(--k-out); stroke-dasharray: 5 4 }
+.port { fill: var(--paper); stroke-width: 1.5; transition: opacity .2s }
+.port.k-call { stroke: var(--k-call) } .port.k-http { stroke: var(--k-http) } .port.k-data { stroke: var(--k-data) } .port.k-ui { stroke: var(--k-ui) } .port.k-out { stroke: var(--k-out) }
+/* brackets over the columns: Uses it · In focus · It reaches */
+.band path { fill: none; stroke: var(--muted); stroke-opacity: .55; stroke-width: 1.4 }
+.band text { font: 600 12px var(--mono); fill: var(--muted); letter-spacing: .08em; text-transform: uppercase; dominant-baseline: central }
+.fc .d { font: 400 10.5px var(--mono); fill: var(--ink); opacity: .78 }
+.fc .m { font: 500 10px var(--mono); fill: var(--muted) }
+.fc .tl { display: none; font: 700 22px var(--mono); fill: var(--ink); letter-spacing: -.01em }
+.fc.dir-c rect.box { fill: var(--lane); stroke-dasharray: none }
+.fc.dir-c .t { font-weight: 700 }
+.fc.ext-c rect.box { fill: transparent; stroke: var(--muted); stroke-dasharray: 5 4; filter: none }
+.fc.ext-c .t { fill: var(--muted) }
+/* zoomed out: only a big title is readable, so that's all a box shows; part way: one line of description */
+svg.lod-low .fc .near { display: none }
+svg.lod-low .fc .tl { display: inline }
+svg.lod-mid .fc .d2, svg.lod-mid .fc .m { display: none }
+/* hovering a box fades what it isn't linked to */
+svg.hovering .flowg .node:not(.hl) { opacity: .25 }
+svg.hovering .flowg [data-ea]:not(.hl) { opacity: .1 }
+.tip { position: fixed; z-index: 50; max-width: 340px; pointer-events: none; background: var(--panel); border: 1.5px solid var(--rule); border-radius: 8px; box-shadow: var(--sh); padding: 7px 10px; font-size: 11.5px; line-height: 1.45; color: var(--ink) }
+.tip b { display: block; font-weight: 600; margin-bottom: 2px }
+.tip div { color: var(--muted); overflow-wrap: anywhere }
+.tip div.h { margin-top: 4px; font-size: 10.5px; font-style: italic }
+@media (prefers-reduced-motion: reduce) { .flowg .edge, .port { transition: none } }

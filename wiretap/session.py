@@ -16,6 +16,38 @@ HIT_AT = re.compile(r"^(?:\./)?([\w@./-]+\.(?:py|tsx|ts|jsx|js|mjs|css|scss|sass
 LINE_ONLY = re.compile(r"^(\d+)[:-]", re.M)          # grep -n on a single file
 SED_RANGE = re.compile(r"\bsed\s+-n\s+['\"]?(\d+)(?:,(\d+))?p")
 HEAD_N = re.compile(r"\bhead\s+-(?:n\s*)?(\d+)\b")
+# a subagent's report coming back: Claude Code delivers it as a prompt, but nobody typed it
+HANDBACK = re.compile(r"^\s*(?:Another Claude session sent a message:\s*)?<agent-message\b")
+HEREDOC = re.compile(r"<<-?\s*(['\"]?)(\w+)\1[^\n]*\n.*?\n\s*\2\s*(?=\n|$)", re.S)
+
+
+def strip_heredocs(cmd):
+    """The command without the text it feeds in (`cat > x.py <<EOF … EOF`), so a file's words aren't read as commands."""
+    return HEREDOC.sub("<<…", cmd or "")
+
+
+def prompt_from_transcript(path):
+    """The last prompt the person typed, from a Claude Code transcript (.jsonl). None if unreadable."""
+    import json
+    last = None
+    try:
+        with open(path, encoding="utf-8") as fh:
+            for line in fh:
+                if '"type":"user"' not in line and '"type": "user"' not in line:
+                    continue
+                try:
+                    content = (json.loads(line).get("message") or {}).get("content")
+                except ValueError:
+                    continue
+                if isinstance(content, list):
+                    if any(c.get("type") == "tool_result" for c in content if isinstance(c, dict)):
+                        continue
+                    content = " ".join(c.get("text", "") for c in content if isinstance(c, dict) and c.get("type") == "text")
+                if isinstance(content, str) and content.strip() and not content.lstrip().startswith("<") and not HANDBACK.match(content):
+                    last = content.strip()
+    except OSError:
+        return None
+    return last
 
 
 def split_shell(cmd):
@@ -151,7 +183,8 @@ def fn_diff(old, new):
 
 def parse_tests(text):
     text = text or ""
-    m = re.search(r"=+ (.*?) in [\d.]+s", text)          # pytest
+    # pytest: "==== 3 passed in 0.4s ====", or with -q just "94 passed, 2 deselected in 0.99s"
+    m = re.search(r"=+ (.*?) in [\d.]+s", text) or re.search(r"^((?:\d+ \w+(?:, )?)*\d+ (?:passed|failed|errors?)\b.*?) in [\d.]+s", text, re.M)
     if m:
         s = m.group(1)
         f = re.search(r"(\d+) failed", s)
@@ -161,6 +194,10 @@ def parse_tests(text):
     m = re.search(r"Tests:\s+(?:(\d+) failed, )?(?:\d+ skipped, )?(\d+) passed", text)  # jest / vitest
     if m:
         return {"passed": int(m.group(2)), "failed": int(m.group(1) or 0)}
+    m = re.search(r"^[ℹ#] fail (\d+)\s*$", text, re.M)  # node --test (the pass line may be cut off by `tail`)
+    if m:
+        p = re.search(r"^[ℹ#] pass (\d+)\s*$", text, re.M)
+        return {"passed": int(p.group(1)) if p else None, "failed": int(m.group(1))}
     m = re.search(r"Ran (\d+) tests?.*?\n\s*\n?(OK|FAILED \((?:failures|errors)=(\d+))", text, re.S)  # unittest
     if m:
         failed = int(m.group(3) or 0)
@@ -184,6 +221,7 @@ class Task:
         self.tests = None
         self.plan_text = None
         self.running = None         # {"text", "t"}: a shell command Claude started that hasn't returned yet
+        self.prompt_tried = False   # looked for a missing prompt in the transcript already
 
 
 class Session:
@@ -309,7 +347,14 @@ class Sessions:
         name = h.get("hook_event_name")
         now = time.time()
         if name == "UserPromptSubmit":
-            prompt = (h.get("prompt") or "").strip()
+            prompt = re.sub(r"^(?:\[Image[^\]]*\]\s*)+", "", (h.get("prompt") or "").strip())  # pasted-image notes
+            if HANDBACK.match(prompt):
+                # part of the request Claude is already working on, not a new one
+                task = sess.task(now)
+                task.ended = None
+                first = re.sub(r"<[^>]+>", " ", prompt.split("[Subagent hand-back]")[-1]).strip().splitlines()
+                self._event(sess, task, "handback", text=(first[0] if first else "")[:200] or None)
+                return True
             t = Task(prompt[:500], now)
             if sess.tasks and not sess.tasks[-1].prompt and not sess.tasks[-1].events:
                 sess.tasks[-1] = t  # replace the empty task opened by SessionStart
@@ -321,6 +366,10 @@ class Sessions:
             sess.task(now)
             return True
         task = sess.task(now)
+        if not task.prompt and not task.prompt_tried and h.get("transcript_path"):
+            # the prompt came before Wiretap was listening (or before a restart): read it from the transcript
+            task.prompt_tried = True
+            task.prompt = (prompt_from_transcript(h["transcript_path"]) or "")[:500] or None
         if name in ("Stop", "SubagentStop"):
             if name == "Stop":
                 task.ended = now
@@ -384,17 +433,24 @@ class Sessions:
         if tool == "Bash":
             cmd = ti.get("command") or ""
             sess.last_shell = now
-            if TEST_CMD.search(cmd):
+            if TEST_CMD.search(strip_heredocs(cmd)):
                 out = ""
                 if isinstance(tr, dict):
                     out = (tr.get("stdout") or "") + "\n" + (tr.get("stderr") or "")
                 elif isinstance(tr, str):
                     out = tr
                 res = parse_tests(out)
-                task.tests = {"cmd": cmd[:200], **(res or {"passed": None, "failed": None})}
+                if res or not (task.tests and task.tests.get("failed") is not None):
+                    # a later run that prints no summary (`pytest | grep warning`) keeps the last real result
+                    task.tests = {"cmd": cmd[:200], **(res or {"passed": None, "failed": None})}
                 self._event(sess, task, "test", text=cmd[:200], **(res or {}))
                 return True
             out = (tr.get("stdout") or "") if isinstance(tr, dict) else (tr if isinstance(tr, str) else "")
+            if re.search(r"\bgit\s+commit\b", strip_heredocs(cmd)):
+                # a commit lists files in its output, which would otherwise read as search hits
+                sess.shell_cwd = final_cwd(cmd, sess.shell_cwd or sess.cwd or "/")
+                self._event(sess, task, "run", text=re.sub(r"^\s*cd\s+\S+\s*&&\s*", "", cmd)[:2000])
+                return True
             # Claude Code's shell keeps its directory between commands, so follow `cd` across calls
             base = sess.shell_cwd or sess.cwd or "/"
             named, hits, lines, search, ranges = shell_files(cmd, base, out)
@@ -511,6 +567,8 @@ class Sessions:
                     changed_fns.append(fid.replace("f:", "fn:", 1) + "#" + q)
         ripple_fns, ripple_files = gi.upstream(changed_fns, depth=3, exclude_files=set(t.touched)) if gi else (set(), set())
         off = sorted(f for f in t.touched if t.planned and f not in t.planned)
+        # with no plan to compare against, flag changed files nothing else in the change connects to
+        stray = sorted(gi.stray([f for f, r in t.touched.items() if r["status"] != "deleted"]) - set(off)) if gi and not t.planned else []
         fn_counts = defaultdict(int)
         for rec in t.touched.values():
             for s in rec["fns"].values():
@@ -527,7 +585,7 @@ class Sessions:
                 "created": sum(1 for r in t.touched.values() if r["status"] == "created"),
                 "deleted": sum(1 for r in t.touched.values() if r["status"] == "deleted"),
                 "fns": dict(fn_counts), "ripple_files": len(ripple_files), "ripple_fns": len(ripple_fns),
-                "off_plan": off, "reads": len(t.reads), "tests": t.tests,
+                "off_plan": off, "stray": stray, "reads": len(t.reads), "tests": t.tests,
                 "lines_added": sum(r["add"] for r in t.touched.values()), "lines_removed": sum(r["del"] for r in t.touched.values()),
             },
         }

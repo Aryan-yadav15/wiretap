@@ -20,7 +20,8 @@ import subprocess
 import time
 from collections import defaultdict
 
-from . import py_extract, style_extract
+from . import coverage, py_extract, style_extract
+from .adapters import TS_ADAPTERS
 
 DEFAULT_EXTERNALS_PY = {
     "razorpay": "Razorpay", "firebase_admin": "Firebase", "boto3": "AWS", "botocore": "AWS",
@@ -43,8 +44,12 @@ DEFAULT_HOSTS = {"razorpay.com": "Razorpay", "googleapis.com": "Google APIs", "s
                  "fcm.googleapis.com": "Firebase"}
 
 TS_EXT = (".ts", ".tsx", ".js", ".jsx", ".mjs")
+# bump when what the parsers or adapters record changes, so cached extractions are redone
+EXTRACT_FORMAT = 6
+# objects whose .get(url) / .post(url) are HTTP calls, when an app's config doesn't name its own
+DEFAULT_HTTP_CLIENTS = ["api", "axios", "apiClient", "http", "this.http", "client"]
 SKIP_DIRS = {"node_modules", "venv", ".venv", "__pycache__", "dist", "build", ".git", ".expo", "android", "ios",
-             "coverage", ".next", "migrations", "alembic", "__tests__", "tests", "test"}
+             "coverage", ".next", "migrations", "alembic", "__tests__", "tests", "test", "vendor"}  # vendor: copied-in libraries
 
 LANES = [
     ("screen", "Screens"), ("ui", "Components"), ("style", "Styles"), ("client", "Client logic"), ("route", "API routes"),
@@ -98,6 +103,11 @@ def autodetect(root):
             apps.append(app)
     if not apps:
         return empty("No Python or TypeScript/JavaScript files found here.")
+    # two apps from one folder (a Python package beside a package.json) would both carry the folder's name
+    names = [a["name"] for a in apps]
+    for a in apps:
+        if names.count(a["name"]) > 1:
+            a["name"] += " (Python)" if a["lang"] == "py" else " (JS/TS)"
     py = [a["id"] for a in apps if a["lang"] == "py"]
     for a in apps:
         if a["lang"] == "ts" and len(py) == 1:
@@ -115,7 +125,7 @@ def norm_path(p):
 
 
 def _seg_is_param(s):
-    return "{" in s or s == "*"
+    return "{" in s or s == "*" or s.startswith(":")
 
 
 class App:
@@ -189,7 +199,7 @@ class Project:
                 data = json.load(fh)
         except (OSError, ValueError):
             return
-        if data.get("config") != self.cfg:
+        if data.get("config") != self.cfg or data.get("format") != EXTRACT_FORMAT:
             return
         for a in self.apps:
             entry = data.get("apps", {}).get(a.id, {})
@@ -198,7 +208,7 @@ class Project:
 
     def save_cache(self):
         os.makedirs(self.cache_dir, exist_ok=True)
-        data = {"config": self.cfg, "apps": {a.id: {"extract": a.extract, "stamp": a.stamp} for a in self.apps}}
+        data = {"config": self.cfg, "format": EXTRACT_FORMAT, "apps": {a.id: {"extract": a.extract, "stamp": a.stamp} for a in self.apps}}
         tmp = os.path.join(self.cache_dir, "extract.json.tmp")
         with open(tmp, "w") as fh:
             json.dump(data, fh)
@@ -284,7 +294,7 @@ class Project:
         ts_mod = os.path.normpath(os.path.join(self.root, ts_mod)) if ts_mod else (self.typescript or self._find_typescript(app))
         if not ts_mod:
             raise RuntimeError(f"{app.id}: TypeScript not found. Set \"typescript\" in the config to a node_modules/typescript folder.")
-        payload = {"typescript": ts_mod, "httpClients": app.cfg.get("httpClients", ["api"]),
+        payload = {"typescript": ts_mod, "httpClients": app.cfg.get("httpClients", DEFAULT_HTTP_CLIENTS), "adapters": TS_ADAPTERS,
                    "files": [{"abs": os.path.join(app.root, r), "rel": r} for r in rels]}
         proc = subprocess.run(["node", script], input=json.dumps(payload), capture_output=True, text=True)
         if proc.returncode != 0:
@@ -315,9 +325,52 @@ class _Linker:
         self.stats = defaultdict(int)
         self.unresolved = defaultdict(int)
         self.unmatched_http = []
+        self.imports = defaultdict(set)  # file id -> file ids it imports (same app)
+        self.per_app = defaultdict(lambda: defaultdict(int))  # app id -> counters for the coverage report
+        self.guessed_prefix = {}  # app id -> path prefix worked out from its API calls (no pathPrefix in the config)
         self._edge_seen = set()
 
     # -- helpers --
+    def _app_kind(self, app):
+        """backend: Python, or a TypeScript app with routes and no UI (Express); a Next.js app with both stays a client."""
+        if app.lang == "py":
+            return "backend"
+        ui = any(f.get("component") for x in app.extract.values() for f in x.get("functions", []))
+        return "backend" if self.routes.get(app.id) and not ui else "client"
+
+    def _guess_prefix(self, app, X, url_of, match_route, backends):
+        """With no pathPrefix set: the one prefix (like /api/v1) that makes most of an app's unmatched API calls match a
+        route, as when the client's base URL carries it. Used when it fixes at least 3 calls and half of those unmatched."""
+        calls = set()
+        for x in X.values():
+            for h in x.get("http", []):
+                path = url_of(h.get("url"))
+                if path and not path.startswith("http"):
+                    calls.add((h["method"], norm_path(path)))
+        missed = [(m, p) for m, p in calls if not match_route(m, p)]
+        votes = defaultdict(set)
+        for m, p in missed:
+            segs = p.strip("/").split("/") if p != "/" else []
+            for be in backends:
+                for (rm, rsegs, _, _) in self.routes.get(be, []):
+                    k = len(rsegs) - len(segs)
+                    # the prefix needs one literal segment; a version from a variable (/api/{}) is fine
+                    if k <= 0 or rm not in (m, "ANY") or all(_seg_is_param(x) for x in rsegs[:k]):
+                        continue
+                    if all(a == b or _seg_is_param(a) or _seg_is_param(b) for a, b in zip(segs, rsegs[k:])):
+                        votes["/" + "/".join(rsegs[:k])].add((m, p))
+        if not votes:
+            return None
+        best = max(votes, key=lambda v: len(votes[v]))
+        if len(votes[best]) >= 3 and len(votes[best]) * 2 >= len(missed):
+            self.guessed_prefix[app.id] = best
+            return best
+        return None
+
+    def _count(self, what, app):
+        self.stats[what] += 1
+        self.per_app[app.id][what] += 1
+
     def edge(self, s, t, k, **kw):
         key = (s, t, k, kw.get("l"))
         if key in self._edge_seen or s == t:
@@ -344,13 +397,15 @@ class _Linker:
     def fid(app, rel, qual):
         return f"fn:{app.id}:{rel}#{qual}"
 
-    def role(self, app, rel):
+    def role(self, app, rel, x=None):
         r = rel.replace(os.sep, "/").lower()
         overrides = app.cfg.get("roles", {})
         for prefix, role in overrides.items():
             if r.startswith(prefix.lower()):
                 return role
         if app.lang == "py":
+            if x and x.get("routes"):
+                return "route"  # it defines endpoints, whatever the folder is called
             if "/routers/" in r or "/endpoints/" in r or r.endswith("main.py") or "/api/" in r and r.endswith("api.py"):
                 return "route"
             if "/models/" in r or "/schemas/" in r or r.endswith("database.py") or "/db/" in r:
@@ -371,7 +426,7 @@ class _Linker:
                 fns = x.get("functions", [])
                 self.files.append({
                     "id": f"f:{app.id}:{rel}", "app": app.id, "rel": rel.replace(os.sep, "/"),
-                    "label": os.path.basename(rel), "role": self.role(app, rel), "lines": x.get("lines", 0),
+                    "label": os.path.basename(rel), "role": self.role(app, rel, x), "lines": x.get("lines", 0),
                     "error": x.get("error"),
                 })
                 for f in fns:
@@ -390,21 +445,24 @@ class _Linker:
         for app in self.p.apps:
             if app.lang == "py":
                 self.link_py(app)
-        for app in self.p.apps:
-            if app.lang != "py":
-                self.link_ts(app)
+        # TypeScript backends (Express, Next.js, ...) declare routes too: collect every app's routes before matching calls
+        finish = [self.link_ts(app) for app in self.p.apps if app.lang != "py"]
+        for f in finish:
+            f()
 
         self.stats["files"] = len(self.files)
         self.stats["functions"] = len(self.fns)
         self.stats["edges"] = len(self.edges)
         return {
-            "apps": [{"id": a.id, "name": a.name, "lang": a.lang, "root": a.root, "kind": "client" if a.lang != "py" else "backend",
+            "apps": [{"id": a.id, "name": a.name, "lang": a.lang, "root": a.root, "kind": self._app_kind(a),
                       "backend": a.cfg.get("backend")} for a in self.p.apps],
             "lanes": [{"id": k, "label": v} for k, v in LANES],
             "files": self.files, "fns": self.fns, "nodes": list(self.nodes.values()), "edges": self.edges,
             "stats": dict(self.stats),
             "unresolved": sorted(self.unresolved.items(), key=lambda kv: -kv[1])[:60],
             "unmatched_http": self.unmatched_http[:300],
+            "imports": {f: sorted(t) for f, t in self.imports.items()},
+            "coverage": coverage.report(self.p, self),
         }
 
     # ================= Python =================
@@ -431,6 +489,12 @@ class _Linker:
                 if m in mods:
                     return m, ".".join(parts[i:])
             return None, dotted
+
+        for rel, x in app.extract.items():
+            for target in x["imports"].values():
+                m, _ = split_module(target)
+                if m and mods[m] != rel:
+                    self.imports[f"f:{app.id}:{rel}"].add(f"f:{app.id}:{mods[m]}")
 
         def resolve(x, qual, target):
             """Return a function id, ('ext', name) or None."""
@@ -500,7 +564,7 @@ class _Linker:
                     head = c["target"].split(".")[0]
                     if head in x["imports"] and split_module(x["imports"][head])[0]:
                         self.unresolved[f"{app.id}: {c['target']}"] += 1
-                        self.stats["unresolved_calls"] += 1
+                        self._count("unresolved_calls", app)
 
             # DB tables (Supabase style)
             seen = {}
@@ -583,9 +647,11 @@ class _Linker:
             for pk, ck, pref in includes:
                 if pk == key:
                     walk(ck, full + pref, depth + 1)
-        for av in app_vars:
+        for av in app_vars or {p for p, _, _ in includes} - {c for _, c, _ in includes}:
             walk(av, "")
         routes = []
+        # a sync def endpoint takes a worker thread in FastAPI; in Flask it's simply how views are written
+        fastapi = any(v.split(".")[0] == "fastapi" for x in app.extract.values() for v in x["imports"].values())
         for rel, x in app.extract.items():
             m = x["module"]
             for r in x.get("routes", []):
@@ -597,7 +663,7 @@ class _Linker:
                 handler = self.fid(app, rel, r["fn"])
                 self.nodes[rid]["fn"] = handler
                 self.edge(rid, handler, "trig")
-                if r.get("sync"):
+                if r.get("sync") and fastapi:
                     self.edge(handler, self._threadpool(app, "threadpool"), "res", l="sync def endpoint")
                 routes.append((r["method"], path.strip("/").split("/") if path != "/" else [], rid, handler))
                 if "webhook" in path or "callback" in path:
@@ -677,6 +743,10 @@ class _Linker:
                 for n in imp["names"]:
                     b[n["local"]] = ("named", imp["spec"], n["imported"])
             bindings[rel] = b
+            for imp in x["imports"]:
+                tgt = resolve_spec(rel, imp["spec"])
+                if tgt and tgt != rel:
+                    self.imports[f"f:{app.id}:{rel}"].add(f"f:{app.id}:{tgt}")
 
         destructured = {}  # (rel, fn qual, local) -> (prop, hook)
         for rel, x in X.items():
@@ -755,121 +825,213 @@ class _Linker:
                         break
             return None
 
-        # constants for URL building, app-wide
-        consts = {}
-        for x in X.values():
-            consts.update(x.get("consts", {}))
-
-        def url_of(parts, depth=0):
-            if parts is None or depth > 4:
-                return None
-            out = []
-            for i, p in enumerate(parts):
-                if "s" in p:
-                    out.append(p["s"])
-                elif "p" in p:
-                    out.append("{}")
-                elif "ref" in p:
-                    v = consts.get(p["ref"])
-                    s = url_of(v, depth + 1) if v else None
-                    if s is None or s.startswith("http") or s == "{}":
-                        if not "".join(out):
-                            continue  # base URL variable at the start: drop it
-                        out.append("{}")
-                    else:
-                        out.append(s)
-            return "".join(out)
-
-        prefix = app.cfg.get("pathPrefix", "")
-        backends = app.cfg.get("backend")
-        backends = [backends] if isinstance(backends, str) else (backends or [])
-
-        def match_route(method, path):
-            segs = path.strip("/").split("/") if path != "/" else []
-            best, best_score = None, -1
-            for be in backends:
-                for (m, rsegs, rid, handler) in self.routes.get(be, []):
-                    if m != method or len(rsegs) != len(segs):
-                        continue
-                    score = 0
-                    ok = True
-                    for a, b in zip(segs, rsegs):
-                        if a == b:
-                            score += 2
-                        elif _seg_is_param(a) or _seg_is_param(b):
-                            score += 0
-                        else:
-                            ok = False
-                            break
-                    if ok and score > best_score:
-                        best, best_score = (rid, handler), score
-            return best
-
-        screen_dirs = tuple(app.cfg.get("screenDirs", ["/pages/", "/screens/"]))
+        # Routes declared in this app: Express-style routers mounted with app.use(), file-based routes (Next.js)
+        routers, includes, roots = {}, [], []
         for rel, x in X.items():
-            names = fn_names[rel]
-            for c in x.get("calls", []):
-                r = resolve(rel, c["from"], c["target"])
-                src = self.fid(app, rel, c["from"])
-                if r is None:
-                    b = bindings[rel].get(c["target"].split(".")[0])
-                    if not c.get("ref") and b and resolve_spec(rel, b[1]):
-                        self.unresolved[f"{app.id}: {c['target']}"] += 1
-                        self.stats["unresolved_calls"] += 1
-                    continue
-                if r[0] == "ext":
-                    self.edge(src, self.ext_node(r[1]), "ext", line=c["line"])
+            for var, pref in x.get("routers", {}).items():
+                routers[(rel, var)] = pref
+            roots += [(rel, v) for v in x.get("app_vars", [])]
+
+        def key_of(rel, name):
+            """A router named in `rel` -> (file, variable) where it is created."""
+            head = name.split(".")[0]
+            if (rel, head) in routers or (rel, head) in roots:
+                return (rel, head)
+            b = bindings[rel].get(head)
+            tgt = resolve_spec(rel, b[1]) if b else None
+            if not tgt:
+                return None
+            if b[0] == "ns":
+                local = X[tgt]["exports"].get(name.split(".")[1]) if "." in name else None
+            elif b[2] == "default":
+                local = X[tgt].get("defaultExport")
+            else:
+                local = X[tgt]["exports"].get(b[2], b[2])
+            return (tgt, local) if local else None
+
+        for rel, x in X.items():
+            for inc in x.get("includes", []):
+                if inc.get("spec"):
+                    tgt = resolve_spec(rel, inc["spec"])
+                    ck = (tgt, X[tgt].get("defaultExport")) if tgt else None
                 else:
-                    self.edge(src, r[0], "call", line=c["line"], c=r[1])
-            db = app.cfg.get("db")
-            for t in x.get("tables", []):
-                db_id = (db or {}).get("id", "supabase")
-                table = t["table"]
-                rpc = table.startswith("rpc:")
-                label = (table[4:] + "()") if rpc else (table[8:] + " (storage)") if table.startswith("storage:") else table
-                tid = self.node(f"tb:{db_id}:{table}", kind="table", label=label,
-                                db=db_id, dbname=(db or {}).get("name", "Supabase Postgres"), rpc=rpc)
-                self.edge(self.fid(app, rel, t["fn"]), tid, {"read": "read", "write": "write"}.get(t["op"], "db"),
-                          line=t["line"], l="direct from client")
-            for rd in x.get("renders", []):
-                r = resolve(rel, rd["from"], rd["tag"])
-                if r and r[0] != "ext":
-                    self.edge(self.fid(app, rel, rd["from"]), r[0], "renders", line=rd["line"], c=r[1])
-            for i, t in enumerate(x.get("triggers", [])):
-                r = resolve(rel, t["from"], t["target"])
-                if r and r[0] != "ext":
-                    label = f"{t['event']} on <{t['tag']}>" + (f" “{t['text']}”" if t.get("text") else "")
-                    self.trig(app, rel, t["line"], label, "ui", r[0], i)
-            for h in x.get("http", []):
-                path = url_of(h.get("url"))
-                src = self.fid(app, rel, h["from"])
-                if path is None:
-                    self.stats["http_unknown_url"] += 1
-                    continue
-                path = norm_path(prefix + path) if not path.startswith("http") else path
-                if path.startswith("http"):
-                    host = path.split("/")[2] if path.count("/") >= 2 else path
-                    name = next((v for k, v in self.p.hosts.items() if k in host), host)
-                    self.edge(src, self.ext_node(name), "ext", line=h["line"], l=path[:80])
-                    continue
-                m = match_route(h["method"], path)
-                label = f"{h['method']} {path}"
-                if m:
-                    self.edge(src, m[1], "http", line=h["line"], l=label)
-                    self.stats["http_matched"] += 1
-                else:
-                    be = backends[0] if backends else "?"
-                    rid = self.node(f"rt:{be}:{h['method']} {path}", kind="route", app=be, method=h["method"], path=path,
-                                    label=label, missing=True)
-                    self.edge(src, rid, "http", line=h["line"], l=label)
-                    self.stats["http_unmatched"] += 1
-                    self.unmatched_http.append({"app": app.id, "file": rel, "line": h["line"], "call": label})
-            # Screens: top-level components in pages/ or screens/ start when the screen opens
-            if any(d in "/" + rel.replace(os.sep, "/") for d in screen_dirs):
+                    ck = key_of(rel, inc["child"])
+                if ck:
+                    includes.append(((rel, inc["parent"]), ck, inc["prefix"] or ""))
+        mount = {}
+
+        def walk(key, acc, depth=0):
+            if depth > 8 or key in mount:
+                return
+            mount[key] = acc + routers.get(key, "")
+            for pk, ck, pref in includes:
+                if pk == key:
+                    walk(ck, mount[key] + pref, depth + 1)
+        for r in roots or {p for p, _, _ in includes} - {c for _, c, _ in includes}:
+            walk(r, "")
+        routes = []
+        for rel, x in X.items():
+            for r in x.get("routes", []):
+                key = (rel, r.get("owner"))
+                path = norm_path(mount.get(key, routers.get(key, "")) + r["path"])
+                handler = self.fid(app, rel, r["fn"]) if r.get("fn") else None
+                if not handler and r.get("target"):
+                    h = resolve(rel, r.get("from") or "", r["target"])
+                    handler = h[0] if h and h[0] != "ext" else None
+                rid = self.node(f"rt:{app.id}:{r['method']} {path}", kind="route", app=app.id, method=r["method"], path=path,
+                                label=f"{r['method']} {path}", file=f"f:{app.id}:{rel}", mounted=key in mount)
+                if handler in self.fn_ids:
+                    self.nodes[rid]["fn"] = handler
+                    self.edge(rid, handler, "trig")
+                routes.append((r["method"], path.strip("/").split("/") if path != "/" else [], rid, handler))
+        self.routes[app.id] = routes
+        self.stats[f"routes_{app.id}"] = len(routes)
+
+        # Prisma model accessors (prisma.orderItem) -> table names, from schema.prisma (@@map) when there is one
+        prisma_tables = {}
+        for dp, dns, fns in os.walk(app.root):
+            dns[:] = [d for d in dns if d not in SKIP_DIRS and not d.startswith(".")] if dp.count(os.sep) - app.root.count(os.sep) < 3 else []
+            for f in fns:
+                if f.endswith(".prisma"):
+                    try:
+                        with open(os.path.join(dp, f), encoding="utf-8", errors="replace") as fh:
+                            schema = fh.read()
+                    except OSError:
+                        continue
+                    for m in re.finditer(r"^model\s+(\w+)\s*\{(.*?)^\}", schema, re.M | re.S):
+                        mapped = re.search(r'@@map\(\s*"([^"]+)"', m.group(2))
+                        prisma_tables[m.group(1)[:1].lower() + m.group(1)[1:]] = mapped.group(1) if mapped else m.group(1)
+
+        def finish():
+
+            # constants for URL building, app-wide
+            consts = {}
+            for x in X.values():
+                consts.update(x.get("consts", {}))
+
+            def url_of(parts, depth=0):
+                if parts is None or depth > 4:
+                    return None
+                out = []
+                for i, p in enumerate(parts):
+                    if "s" in p:
+                        out.append(p["s"])
+                    elif "p" in p:
+                        out.append("{}")
+                    elif "ref" in p:
+                        v = consts.get(p["ref"])
+                        s = url_of(v, depth + 1) if v else None
+                        if s is None or s.startswith("http") or s == "{}":
+                            if not "".join(out):
+                                continue  # base URL variable at the start: drop it
+                            out.append("{}")
+                        else:
+                            out.append(s)
+                return "".join(out)
+
+            prefix = app.cfg.get("pathPrefix", "")
+            backends = app.cfg.get("backend")
+            backends = [backends] if isinstance(backends, str) else (backends or [a.id for a in self.p.apps if a.id != app.id and self.routes.get(a.id)])
+            if self.routes.get(app.id) and app.id not in backends:
+                backends = backends + [app.id]
+
+            def match_route(method, path):
+                segs = path.strip("/").split("/") if path != "/" else []
+                best, best_score = None, -1
+                for be in backends:
+                    for (m, rsegs, rid, handler) in self.routes.get(be, []):
+                        if m not in (method, "ANY") or len(rsegs) != len(segs):
+                            continue
+                        score = 0
+                        ok = True
+                        for a, b in zip(segs, rsegs):
+                            if a == b:
+                                score += 2
+                            elif _seg_is_param(a) or _seg_is_param(b):
+                                score += 0
+                            else:
+                                ok = False
+                                break
+                        if ok and score > best_score:
+                            best, best_score = (rid, handler), score
+                return best
+
+            if "pathPrefix" not in app.cfg:
+                prefix = self._guess_prefix(app, X, url_of, match_route, backends) or prefix
+
+            screen_dirs = tuple(app.cfg.get("screenDirs", ["/pages/", "/screens/"]))
+            for rel, x in X.items():
+                names = fn_names[rel]
+                for c in x.get("calls", []):
+                    r = resolve(rel, c["from"], c["target"])
+                    src = self.fid(app, rel, c["from"])
+                    if r is None:
+                        b = bindings[rel].get(c["target"].split(".")[0])
+                        if not c.get("ref") and b and resolve_spec(rel, b[1]):
+                            self.unresolved[f"{app.id}: {c['target']}"] += 1
+                            self._count("unresolved_calls", app)
+                        continue
+                    if r[0] == "ext":
+                        self.edge(src, self.ext_node(r[1]), "ext", line=c["line"])
+                    else:
+                        self.edge(src, r[0], "call", line=c["line"], c=r[1])
+                db = app.cfg.get("db")
+                for t in x.get("tables", []):
+                    table = t["table"]
+                    kind = {"read": "read", "write": "write"}.get(t["op"], "db")
+                    if table.startswith("prisma:"):
+                        name = prisma_tables.get(table[7:], table[7:])
+                        db_id = (db or {}).get("id", "prisma")
+                        tid = self.node(f"tb:{db_id}:{name}", kind="table", label=name, db=db_id, dbname=(db or {}).get("name", "Database (Prisma)"))
+                        self.edge(self.fid(app, rel, t["fn"]), tid, kind, line=t["line"], l=table[7:])
+                        continue
+                    db_id = (db or {}).get("id", "supabase")
+                    rpc = table.startswith("rpc:")
+                    label = (table[4:] + "()") if rpc else (table[8:] + " (storage)") if table.startswith("storage:") else table
+                    tid = self.node(f"tb:{db_id}:{table}", kind="table", label=label,
+                                    db=db_id, dbname=(db or {}).get("name", "Supabase Postgres"), rpc=rpc)
+                    self.edge(self.fid(app, rel, t["fn"]), tid, kind, line=t["line"], l="direct from client")
+                for rd in x.get("renders", []):
+                    r = resolve(rel, rd["from"], rd["tag"])
+                    if r and r[0] != "ext":
+                        self.edge(self.fid(app, rel, rd["from"]), r[0], "renders", line=rd["line"], c=r[1])
+                for i, t in enumerate(x.get("triggers", [])):
+                    r = resolve(rel, t["from"], t["target"])
+                    if r and r[0] != "ext":
+                        label = f"{t['event']} on <{t['tag']}>" + (f" “{t['text']}”" if t.get("text") else "")
+                        self.trig(app, rel, t["line"], label, "ui", r[0], i)
+                for h in x.get("http", []):
+                    path = url_of(h.get("url"))
+                    src = self.fid(app, rel, h["from"])
+                    if path is None:
+                        self._count("http_unknown_url", app)
+                        continue
+                    path = norm_path(prefix + path) if not path.startswith("http") else path
+                    if path.startswith("http"):
+                        host = path.split("/")[2] if path.count("/") >= 2 else path
+                        name = next((v for k, v in self.p.hosts.items() if k in host), host)
+                        self.edge(src, self.ext_node(name), "ext", line=h["line"], l=path[:80])
+                        continue
+                    m = match_route(h["method"], path)
+                    label = f"{h['method']} {path}"
+                    if m:
+                        self.edge(src, m[1], "http", line=h["line"], l=label)
+                        self._count("http_matched", app)
+                    else:
+                        be = backends[0] if backends else "?"
+                        rid = self.node(f"rt:{be}:{h['method']} {path}", kind="route", app=be, method=h["method"], path=path,
+                                        label=label, missing=True)
+                        self.edge(src, rid, "http", line=h["line"], l=label)
+                        self._count("http_unmatched", app)
+                        self.unmatched_http.append({"app": app.id, "file": rel, "line": h["line"], "call": label})
+                # Screens: top-level components in pages/ or screens/ start when the screen opens
+                if any(d in "/" + rel.replace(os.sep, "/") for d in screen_dirs):
+                    for f in x["functions"]:
+                        if f.get("component") and not f.get("parent"):
+                            self.trig(app, rel, f["line"], "Screen opens", "screen", self.fid(app, rel, f["name"]), 900)
                 for f in x["functions"]:
-                    if f.get("component") and not f.get("parent"):
-                        self.trig(app, rel, f["line"], "Screen opens", "screen", self.fid(app, rel, f["name"]), 900)
-            for f in x["functions"]:
-                if f["name"] in ("App", "default") and not f.get("parent") and rel.count(os.sep) <= 1 and "App" in rel:
-                    self.trig(app, rel, f["line"], "App starts", "app", self.fid(app, rel, f["name"]), 901)
-            _ = names
+                    if f["name"] in ("App", "default") and not f.get("parent") and rel.count(os.sep) <= 1 and "App" in rel:
+                        self.trig(app, rel, f["line"], "App starts", "app", self.fid(app, rel, f["name"]), 901)
+                _ = names
+
+        return finish
