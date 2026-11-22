@@ -567,8 +567,10 @@ class Sessions:
                     changed_fns.append(fid.replace("f:", "fn:", 1) + "#" + q)
         ripple_fns, ripple_files = gi.upstream(changed_fns, depth=3, exclude_files=set(t.touched)) if gi else (set(), set())
         off = sorted(f for f in t.touched if t.planned and f not in t.planned)
-        # with no plan to compare against, flag changed files nothing else in the change connects to
-        stray = sorted(gi.stray([f for f, r in t.touched.items() if r["status"] != "deleted"]) - set(off)) if gi and not t.planned else []
+        # how the changed files link to each other; with no plan to compare against, flag the ones with no link found
+        alive = [f for f, r in t.touched.items() if r["status"] != "deleted"]
+        links = gi.links(alive) if gi else {}
+        stray = sorted(gi.stray(alive) - set(off)) if gi and not t.planned else []
         fn_counts = defaultdict(int)
         for rec in t.touched.values():
             for s in rec["fns"].values():
@@ -579,7 +581,7 @@ class Sessions:
             "touched": {f: {k: v for k, v in r.items() if k != "baseline"} for f, r in t.touched.items()},
             "reads": sorted(t.reads), "tests": t.tests, "running": t.running,
             "looked": [{"file": f, "fns": [{"name": q, "how": r["how"], "score": round(r["score"], 2)} for q, r in rec.items()]} for f, rec in t.looked.items()],
-            "ripple_files": sorted(ripple_files), "ripple_fns": sorted(ripple_fns)[:400],
+            "ripple_files": sorted(ripple_files), "ripple_fns": sorted(ripple_fns)[:400], "links": links,
             "summary": {
                 "edited": sum(1 for r in t.touched.values() if r["status"] == "edited"),
                 "created": sum(1 for r in t.touched.values() if r["status"] == "created"),

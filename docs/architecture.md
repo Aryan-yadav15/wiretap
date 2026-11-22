@@ -11,7 +11,7 @@ Wiretap is one local Python process. It parses a project's Python and TypeScript
 | TypeScript parser | functions, components, handlers, imports (ES and CommonJS), JSX `onClick` / `onPress`, renders; runs the TypeScript adapters | [`wiretap/ts_extract.mjs`](../wiretap/ts_extract.mjs) |
 | Adapters | one per framework or library: routes, router prefixes and mounts, table use, HTTP calls, jobs | [`wiretap/adapters/`](../wiretap/adapters/), [adapters.md](adapters.md) |
 | Coverage | per app, what each adapter found and how many API calls matched; other languages and unread libraries | [`wiretap/coverage.py`](../wiretap/coverage.py) |
-| Stylesheet reader | each CSS / SCSS / Less rule as a "function" named by its selector, so edits are reported per rule; HTML files listed | [`wiretap/style_extract.py`](../wiretap/style_extract.py) |
+| Stylesheet reader | each CSS / SCSS / Less rule as a "function" named by its selector, so edits are reported per rule; HTML pages with the scripts and stylesheets they load, and which stylesheets a script's class names come from | [`wiretap/style_extract.py`](../wiretap/style_extract.py) |
 | Project + linker | which files to read, the extraction cache, and linking: imports, HTTP calls to routes, tables, resources, where flows start; `autodetect` for a folder with no config | [`wiretap/graph.py`](../wiretap/graph.py) |
 | Sessions | turns hook events into a timeline: reads (including shell `grep` / `sed`), plan, function-level diffs, tests | [`wiretap/session.py`](../wiretap/session.py) |
 | Server | HTTP + server-sent events, file watcher, hook queue routed to the right project, feature-trace search, optional summary. `State` holds every project; one `ProjectState` per project holds its graph and sessions | [`wiretap/server.py`](../wiretap/server.py) |
@@ -23,7 +23,7 @@ Wiretap is one local Python process. It parses a project's Python and TypeScript
 - **Browser ↔ server:** plain HTTP for the graph, source excerpts, search and sessions; one long-lived server-sent-events stream (`/api/stream`) pushes graph, session and new-project updates to every open tab, each tagged with its project ([`server.py:422`](../wiretap/server.py#L422)).
 - **Claude Code → server:** each hooked event runs one `curl` that POSTs the hook payload to `/api/hook` ([`__main__.py:23`](../wiretap/__main__.py#L23)). The server answers before doing any work and queues the payload ([`server.py:456`](../wiretap/server.py#L456)); one worker thread processes the queue in order ([`server.py:288`](../wiretap/server.py#L288)) and sends each payload to the project its `cwd` is in, mapping that folder first if no project covers it ([`server.py:270`](../wiretap/server.py#L270)).
 - **Server → TypeScript parser:** a Node child process per batch of files, reading JSON on stdin and writing JSON on stdout ([`graph.py:289`](../wiretap/graph.py#L289)).
-- **Server → Claude:** only when you press **Summarize with Claude**: `claude -p --model haiku` with the git diff on stdin ([`server.py:226`](../wiretap/server.py#L226)).
+- **Server → Claude:** only when you press **Summarize with Claude**: `claude -p --model haiku` with the git diff on stdin ([`server.py:226`](../wiretap/server.py#L226)); in Simple mode ([`simplify.py`](../wiretap/simplify.py)); and in **Ask**: `claude -p --model sonnet --effort high` in the project folder with read-only tools, its answer streamed to the browser as it writes ([`ask.py`](../wiretap/ask.py)).
 
 ## Main flow: what happens on one Claude Code tool call
 

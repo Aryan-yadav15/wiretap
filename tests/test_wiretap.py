@@ -20,7 +20,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
 
 from wiretap.graph import Project  # noqa: E402
-from wiretap.server import State, make_handler, term_regex  # noqa: E402
+from wiretap.server import GraphIndex, State, make_handler, term_regex  # noqa: E402
 from wiretap.session import parse_tests  # noqa: E402
 from wiretap.simplify import DescribeError, Describer, cut_steps, jobs_for  # noqa: E402
 from http.server import ThreadingHTTPServer  # noqa: E402
@@ -195,6 +195,18 @@ class TestStacks(unittest.TestCase):
         g = self.build()
         self.assertIn("f:express:src/routes/orders.js", g["imports"]["f:express:src/server.js"])
         self.assertIn("f:express:src/controllers/orders.js", g["imports"]["f:express:src/routes/orders.js"])
+
+    def test_pages_load_scripts_and_scripts_use_stylesheets(self):
+        g = self.build()
+        # <script src> and <link href> from the site root are read from the page's folder; other sites are skipped
+        self.assertEqual(g["imports"]["f:web:src/index.html"], ["f:web:src/page.js", "f:web:src/style.css"])
+        # two of the sheet's classes make a link; one ("active") doesn't
+        self.assertEqual(g["styles"], {"f:web:src/page.js": ["f:web:src/style.css"]})
+        gi = GraphIndex(g)
+        links = gi.links(["f:web:src/index.html", "f:web:src/page.js", "f:web:src/style.css", "f:web:src/toggle.js"])
+        self.assertEqual(sorted(links["f:web:src/page.js"]), [["f:web:src/index.html", "loaded by"], ["f:web:src/style.css", "styled by"]])
+        self.assertEqual(links["f:web:src/toggle.js"], [])
+        self.assertEqual(gi.stray(links), {"f:web:src/toggle.js"})
 
 
 class TestHelpers(unittest.TestCase):
@@ -461,6 +473,41 @@ class TestSimplify(FixtureCase):
         self.assertEqual(sum(len(st["ids"]) for st in res["steps"]), len(ids))  # every function is in a step
         self.assertEqual(res["steps"][0]["layer"], "route")
         self.assertTrue(state.primary.describer.fresh(g)["fns"])  # the flow's files were described on the way
+
+
+class TestAsk(unittest.TestCase):
+    def test_answer_streams_from_a_read_only_claude(self):
+        from wiretap import ask
+        # a fake `claude` on PATH prints what `claude -p --output-format stream-json` would, and the arguments it got
+        d = tempfile.mkdtemp(prefix="wt-ask-")
+        self.addCleanup(shutil.rmtree, d, True)
+        events = [
+            {"type": "system", "subtype": "init", "session_id": "s-1"},
+            {"type": "assistant", "message": {"content": [{"type": "tool_use", "name": "Read", "input": {"file_path": "/r/app/orders.py"}}]}},
+            {"type": "stream_event", "event": {"type": "content_block_start", "index": 1, "content_block": {"type": "text"}}},
+            {"type": "stream_event", "event": {"type": "content_block_delta", "index": 1, "delta": {"type": "text_delta", "text": "In orders.py"}}},
+            {"type": "stream_event", "parent_tool_use_id": "t", "event": {"type": "content_block_delta", "delta": {"type": "text_delta", "text": "subagent"}}},
+            {"type": "result", "session_id": "s-1", "total_cost_usd": 0.01, "duration_ms": 900},
+        ]
+        fake = os.path.join(d, "claude")
+        with open(fake, "w") as fh:
+            fh.write("#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$(dirname \"$0\")/args\"\ncat <<'EOF'\n" + "\n".join(json.dumps(e) for e in events) + "\nEOF\n")
+        os.chmod(fake, 0o755)
+        old = os.environ["PATH"]
+        os.environ["PATH"] = d + os.pathsep + old
+        self.addCleanup(os.environ.__setitem__, "PATH", old)
+        got = list(ask.ask("where are orders made?", d, "sys", resume="s-0"))
+        self.assertEqual([e["t"] for e in got], ["session", "tool", "text", "done"])
+        self.assertEqual(got[1]["d"], "Reading orders.py")
+        self.assertEqual(got[2]["d"], "In orders.py")
+        self.assertEqual(got[3]["session"], "s-1")
+        with open(os.path.join(d, "args")) as fh:
+            args = fh.read().split("\n")
+        self.assertEqual(args[args.index("--model") + 1], "sonnet")
+        self.assertEqual(args[args.index("--effort") + 1], "high")
+        self.assertEqual(args[args.index("--tools") + 1:args.index("--tools") + 4], ["Read", "Grep", "Glob"])
+        self.assertEqual(args[args.index("--resume") + 1], "s-0")
+        self.assertEqual(args[-2:], ["where are orders made?", ""])
 
 
 class StyleTest(unittest.TestCase):

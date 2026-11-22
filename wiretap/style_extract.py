@@ -1,12 +1,32 @@
 """Stylesheets and HTML: each CSS rule counts as a "function" (named by its selector), so reads and edits of a
-stylesheet are reported per rule, the same way code is reported per function. HTML files are listed with no rules."""
+stylesheet are reported per rule, the same way code is reported per function. HTML files are listed with no rules, but with the scripts and stylesheets they load."""
 
 import bisect
 import hashlib
+import re
 
 STYLE_EXT = (".css", ".scss", ".sass", ".less")
 MARKUP_EXT = (".html",)
 GROUPS = ("@media", "@supports", "@layer", "@container", "@document")
+
+
+LOAD_RE = {
+    "html": re.compile(r"""<script\b[^>]*?\bsrc\s*=\s*["']([^"']+)|<link\b[^>]*?\bhref\s*=\s*["']([^"']+\.css)\b""", re.I),
+    "css": re.compile(r"""@import\s+(?:url\()?\s*["']([^"']+)"""),
+}
+
+
+def loads(src, rel):
+    """Files an HTML page loads (<script src>, <link href=*.css>) or a stylesheet @imports, as relative paths.
+    A path from the site root (/app.js) is read from the page's own folder, where the server usually serves it."""
+    rx = LOAD_RE["html"] if rel.endswith(MARKUP_EXT) else LOAD_RE["css"] if rel.endswith(STYLE_EXT) else None
+    out = []
+    for m in rx.finditer(src) if rx else ():
+        spec = next(g for g in m.groups() if g).split("?")[0].split("#")[0]
+        if "://" in spec or spec.startswith(("//", "data:")):
+            continue
+        out.append("./" + spec.lstrip("/") if spec.startswith("/") or not spec.startswith(".") else spec)
+    return out
 
 
 def extract(src, rel):
@@ -14,6 +34,7 @@ def extract(src, rel):
            # the TypeScript linker reads these keys from every file in the app
            "imports": [], "reexports": [], "exports": {}, "defaultExport": None, "calls": [], "http": [],
            "renders": [], "triggers": [], "consts": {}, "destructured": []}
+    out["imports"] = [{"spec": s, "names": [], "def": None, "ns": None} for s in loads(src, rel)]
     if not rel.endswith(STYLE_EXT):
         return out
     starts = [0] + [i + 1 for i, c in enumerate(src) if c == "\n"]

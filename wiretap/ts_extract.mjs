@@ -89,6 +89,16 @@ function jsxText(node, sf) {
   return s.length > 44 ? s.slice(0, 42) + '…' : s;
 }
 
+// class names a file puts on elements: className="a b", class="a b" in template strings, classList.add('a');
+// the linker matches them to stylesheet selectors, so a file is linked to the stylesheet that styles it
+function classNames(text) {
+  const out = new Set();
+  const add = s => { for (const t of s.replace(/\$\{[^}]*\}/g, ' ').split(/\s+/)) if (/^-?[A-Za-z_][\w-]*$/.test(t)) out.add(t); };
+  for (const m of text.matchAll(/\bclass(?:Name)?\s*=\s*\{?\s*["'`]([^"'`]*)["'`]/g)) add(m[1]);
+  for (const m of text.matchAll(/classList\.(?:add|remove|toggle)\(\s*["']([^"']+)["']/g)) add(m[1]);
+  return [...out].sort();
+}
+
 function extract(file) {
   const text = readFileSync(file.abs, 'utf8');
   const sf = ts.createSourceFile(file.rel, text, ts.ScriptTarget.Latest, true, kindFor(file.rel));
@@ -97,7 +107,7 @@ function extract(file) {
     lang: 'ts', rel: file.rel, imports: [], reexports: [], exports: {}, defaultExport: null,
     functions: [], calls: [], http: [], renders: [], triggers: [], consts: {}, destructured: [], tables: [], instances: {},
     routes: [], routers: {}, includes: [], app_vars: [],
-    lines: text.split('\n').length, error: null,
+    lines: text.split('\n').length, error: null, classes: classNames(text),
   };
   const fnNodes = new Map(); // node -> qual
   const fns = [];

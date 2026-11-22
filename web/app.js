@@ -17,6 +17,7 @@ const S = {
   moved: new Map(), sel: new Set(), ui: { side: true, panel: true, closed: ['steps'] },
   desc: { fns: {}, files: {} }, descBusy: new Set(), descFailed: new Set(), descErr: null, flows: new Map(),
   descRound: { total: 0, done: 0 }, justNamed: new Set(),
+  ask: { msgs: [], session: null, about: null, draft: '', ctrl: null },
 };
 
 // ======================= index =======================
@@ -794,7 +795,8 @@ function render() {
   if (S.r.v === 'live') S.liveDot = false;
   tools(''); chips([]); $('stepper').hidden = true; S.stepNav = null; GEO = null; drawTok++; hideTip();
   renderSide();
-  const v = { system: viewSystem, tree: viewTree, map: viewMap, file: viewFile, link: viewLink, live: viewLive, trace: viewTrace, resources: viewResources }[S.r.v] || viewSystem;
+  if (['file', 'map'].includes(S.r.v) && S.r.id) S.ask.about = S.r.fn || S.r.id;  // Ask sends what you were last looking at
+  const v = { system: viewSystem, tree: viewTree, map: viewMap, file: viewFile, link: viewLink, live: viewLive, trace: viewTrace, resources: viewResources, ask: viewAsk }[S.r.v] || viewSystem;
   try { v(); foldable(); describeOnScreen(); } catch (err) {
     console.error(err);
     $('panel').innerHTML = `<div class="callout"><b>This view hit a bug</b>${esc(err.message)}</div>`;
@@ -1929,7 +1931,7 @@ function viewChange(t, evs, live) {
   const I = S.I, sm = t.summary;
   S.openAreas = S.openAreas || new Set();
   const changed = new Set(live.order.filter(f => I.files.has(f)));
-  const flagged = new Map([...(sm.off_plan || []).map(f => [f, 'not in the plan']), ...(sm.stray || []).map(f => [f, 'nothing else in this change connects to it'])].filter(([f]) => changed.has(f)));
+  const flagged = new Map([...(sm.off_plan || []).map(f => [f, 'not in the plan']), ...(sm.stray || []).map(f => [f, 'no link found to the rest of this change'])].filter(([f]) => changed.has(f)));
   const ripple = changed.size ? (t.ripple_files || []).filter(f => I.files.has(f) && !changed.has(f)) : [];
   const planned = (t.planned || []).filter(f => I.files.has(f) && !changed.has(f));
   const reads = S.showReads ? [...new Set(evs.flatMap(e => e.k === 'read' && e.file ? [e.file] : e.k === 'search' ? (e.files || []).slice(0, 3) : []))].filter(f => I.files.has(f) && !changed.has(f) && !ripple.includes(f) && !planned.includes(f)) : [];
@@ -1972,7 +1974,7 @@ function viewChange(t, evs, live) {
       const top = ['warn', 'edit', 'new', 'up', 'ghost', 'read'].find(k => cnt(k));
       const app = I.apps.get(I.files.get(ms[0]).app);
       return { id: u, cls: top + (ms.some(f => live.cls.get(f)?.includes('cur')) ? ' cur' : ''), title: (multiApp ? appName(app.id) + ' · ' : '') + areaDir(u), sub: names + parts.join(' · '),
-        tip: `${app.name} · ${areaDir(u)}\n${ms.map(f => labelOf(f) + ' — ' + ({ warn: 'changed, probably not needed', edit: 'changed', new: 'new', up: 'uses changed code', ghost: 'planned', read: 'read' }[status(f)])).join('\n')}\nClick to see the files`,
+        tip: `${app.name} · ${areaDir(u)}\n${ms.map(f => labelOf(f) + ' — ' + ({ warn: 'changed, no link found to the rest of this change', edit: 'changed', new: 'new', up: 'uses changed code', ghost: 'planned', read: 'read' }[status(f)])).join('\n')}\nClick to see the files`,
         stripe: `var(--app${I.appIdx.get(app.id) ?? 0})`, badge: cnt('warn') ? '!' : nCh + nNew ? String(nCh + nNew) : null, badgeColor: cnt('warn') ? 'var(--warn)' : 'var(--accent)' };
     }
     if (u.startsWith('f:')) {
@@ -1991,14 +1993,14 @@ function viewChange(t, evs, live) {
   $('svg').querySelectorAll('.grp').forEach(g => { g.onclick = () => toggle(g.dataset.area); g.onkeydown = e => { if (e.key === 'Enter') toggle(g.dataset.area); }; });
   // the toolbar: zoom controls, and anything that needs a look first
   const areas = new Set(files.filter(f => changed.has(f)).map(areaOf));
-  const warn = [...flagged].map(([f, why]) => `<span class="k-warn">⚠ <button class="linkbtn" data-area="${esc(areaOf(f))}">${esc(labelOf(f))}</button> changed, but ${esc(why)}</span>`).join('');
+  const warn = [...flagged].map(([f, why]) => `<span class="k-warn">⚠ <button class="linkbtn" data-area="${esc(areaOf(f))}">${esc(labelOf(f))}</button> changed: ${esc(why)}</span>`).join('');
   tools(`<button class="btn2" id="openall">${[...areas].every(a => S.openAreas.has(a)) && areas.size ? 'Fold all areas' : 'Show all files'}</button>
     <label><input type="checkbox" id="showreads" ${S.showReads ? 'checked' : ''}> Show what it only read</label>
     ${t.running ? `<span><b>Running now:</b> <span class="code">${esc(trunc(t.running.text, 100))}</span></span>` : ''}${warn}`);
   $('openall').onclick = () => { const all = [...areas].every(a => S.openAreas.has(a)); areas.forEach(a => all ? S.openAreas.delete(a) : S.openAreas.add(a)); render(); };
   $('showreads').onchange = e => { S.showReads = e.target.checked; render(); };
   $('tools').querySelectorAll('.linkbtn').forEach(b => b.onclick = () => { S.openAreas.add(b.dataset.area); render(); });
-  legend([['var(--accent)', 'Changed (the number counts changed files)'], ['var(--down)', 'New'], ['var(--up)', 'Uses changed code: recheck it'], ['var(--warn)', '! Probably not needed'], [null, 'Click an area for its files, a file for its code · dashed line = imports']]);
+  legend([['var(--accent)', 'Changed (the number counts changed files)'], ['var(--down)', 'New'], ['var(--up)', 'Uses changed code: recheck it'], ['var(--warn)', '! No link found (or outside the plan)'], [null, 'Click an area for its files, a file for its code · dashed line = imports']]);
   return { files: changed.size, areas: areas.size, recheck: ripple.length };
 }
 // dim everything on the canvas except the boxes holding these files (hovering a phase or a story line)
@@ -2033,6 +2035,8 @@ function viewLive() {
     return;
   }
   const touched = Object.keys(t.touched);
+  // each changed file and what links it to the rest of the change (the linked ones last, so gaps show first)
+  const links = touched.length > 1 ? touched.filter(f => t.links?.[f] && I.files.has(f)).map(f => [f, t.links[f]]).sort((a, b) => !b[1].length - !a[1].length) : [];
   const ids = new Set([...touched.filter(f => I.files.has(f)), ...(t.planned || []).filter(f => I.files.has(f))]);
   const ripple = (t.ripple_files || []).filter(f => I.files.has(f)).sort((a, b) => I.degree(b) - I.degree(a));
   ripple.slice(0, 16).forEach(f => ids.add(f));
@@ -2126,8 +2130,7 @@ function viewLive() {
   if (answer) $('readout').innerHTML = `${lastLine}<small>Question only, nothing changed · ${plural(nLooked, 'function')} looked at in ${plural((t.reads || []).length, 'file')} · the map shows where the clearest ones sit in the flow</small>`;
   else if (change) {
     const tests = sm.tests ? (sm.tests.failed ? `<span class="k-warn">tests ✗ ${sm.tests.failed} failing</span>` : sm.tests.passed != null ? `<span class="k-down">tests ✓ ${sm.tests.passed} passed</span>` : sm.tests.failed === 0 ? '<span class="k-down">tests ✓ none failing</span>' : 'tests ran') : 'no tests run yet';
-    const nWarn = (sm.off_plan || []).length + (sm.stray || []).length;
-    $('readout').innerHTML = `<b>${t.ended ? 'Changed' : 'Changing'}</b> · ${plural(change.files, 'file')} in ${plural(change.areas, 'area')} · <span class="k-up">${change.recheck} to recheck</span>${nWarn ? ` · <span class="k-warn">${nWarn} probably not needed</span>` : ''} · ${tests}<small>${lastLine}</small>`;
+    $('readout').innerHTML = `<b>${t.ended ? 'Changed' : 'Changing'}</b> · ${plural(change.files, 'file')} in ${plural(change.areas, 'area')} · <span class="k-up">${change.recheck} to recheck</span>${sm.off_plan.length ? ` · <span class="k-warn">${sm.off_plan.length} outside the plan</span>` : ''}${(sm.stray || []).length ? ` · <span class="k-warn">${sm.stray.length} with no link found</span>` : ''} · ${tests}<small>${lastLine}</small>`;
   }
   else $('readout').innerHTML = `${lastLine}<small>${plural((t.reads || []).length, 'file')} read · ${sm.edited} edited, ${sm.created} created · ${(sm.fns.changed || 0) + (sm.fns.added || 0) + (sm.fns.removed || 0)} functions changed · <span class="k-up">${sm.ripple_files} other files call changed code</span>${sm.off_plan.length ? ` · <span class="k-warn">${sm.off_plan.length} outside the plan</span>` : ''}</small>`;
 
@@ -2175,11 +2178,12 @@ function viewLive() {
       <div class="stat down"><b>${sm.created}</b><span>files created</span></div>
       <div class="stat acc"><b>${(sm.fns.changed || 0) + (sm.fns.added || 0) + (sm.fns.removed || 0)}</b><span>functions changed</span></div>
       <div class="stat up"><b>${sm.ripple_files}</b><span>files to recheck</span></div>
-      <div class="stat warn"><b>${sm.off_plan.length + (sm.stray || []).length}</b><span>probably not needed</span></div>
+      <div class="stat warn"><b>${sm.off_plan.length + (sm.stray || []).length}</b><span>${sm.off_plan.length ? 'outside the plan' : 'no link found'}</span></div>
       <div class="stat ${sm.tests?.failed ? 'warn' : 'down'}"><b>${sm.tests ? (sm.tests.failed ?? '?') : '–'}</b><span>tests failing</span></div>
     </div>
     ${sm.off_plan.map(f => `<div class="callout"><b>Look here first: ${esc(labelOf(f))}</b>Changed outside the plan: ${esc(Object.keys(t.touched[f].fns).join(', ') || 'no function changes')}</div>`).join('')}
-    ${(sm.stray || []).map(f => `<div class="callout"><b>Look here first: ${esc(labelOf(f))}</b>Changed, but no call, import or table links it to anything else in this change. It may belong to something else.</div>`).join('')}
+    ${(sm.stray || []).map(f => `<div class="callout"><b>No link found: ${esc(labelOf(f))}</b>No call, import, page load, stylesheet or table links it to the rest of this change. It may belong to something else, or be linked in a way Wiretap can't read yet, such as a route written without a framework.</div>`).join('')}
+    ${links.length ? `<div><h3>How the changed files connect</h3><ul class="list">${links.map(([f, ls]) => item([ls.length ? 'acc' : 'risk', ls.length || '!'], esc(labelOf(f)), ls.length ? esc(ls.map(([o, how]) => `${how} ${labelOf(o)}`).join(' · ')) : 'no link found', null, goAttr({ v: 'file', id: f }))).join('')}</ul></div>` : ''}
     ${touched.length ? `<div><h3>Changed functions</h3><ul class="list">${touched.flatMap(f => Object.entries(t.touched[f].fns).map(([q, st]) => item([st === 'added' ? 'down' : st === 'removed' ? 'risk' : 'acc', st], esc(fnShort(q)), null, I.files.get(f)?.rel || f, st !== 'removed' ? goAttr({ v: 'file', id: f, fn: f.replace('f:', 'fn:') + '#' + q }) : ''))).join('')}</ul></div>` : ''}
     ${(t.looked || []).length ? `<div><h3>Functions Claude looked at</h3><ul class="list">${[...t.looked].reverse().flatMap(x => x.fns.map(f => [x, f])).sort((a, b) => (a[1].how === 'read' ? 0 : 1) - (b[1].how === 'read' ? 0 : 1) || (b[1].score || 0) - (a[1].score || 0)).map(([x, f]) => item(['', f.how === 'read' ? 'read' : 'found'], esc(fnShort(f.name)), null, I.files.get(x.file)?.rel || x.file, goAttr(openRoute(x.file.replace('f:', 'fn:') + '#' + f.name)))).slice(0, 15).join('')}</ul></div>` : ''}
     ${ripple.length ? `<div><h3>Calls changed code (recheck)</h3><ul class="list">${ripple.slice(0, 20).map(f => item(['up', 'calls'], esc(labelOf(f)), null, I.files.get(f)?.rel, goAttr({ v: 'file', id: f }))).join('')}</ul></div>` : ''}
@@ -2253,6 +2257,140 @@ function viewTrace() {
     ${[...byApp.entries()].map(([a, hs]) => `<div><h3>${esc(appName(a))}</h3><ul class="list">${hs.slice(0, 40).map(h => item(['acc', h.count], esc(labelOf(h.id)), esc(h.lines[0]?.[1] || ''), pathOf(h.id), goAttr(openRoute(h.id)))).join('')}</ul></div>`).join('')}
     ${T.by_data.length ? `<div><h3>Found by following data</h3><ul class="list">${T.by_data.slice(0, 40).map(id => item(['new', 'data'], esc(labelOf(id)), null, pathOf(id), goAttr(openRoute(id)))).join('')}</ul></div>` : ''}`;
   wireList($('panel'));
+}
+
+// ---------- Ask ----------
+// A question to Claude about this project (claude -p, Sonnet on high effort, read-only), answered as it writes.
+// Follow-ups continue the same Claude session; New chat starts over.
+function askAboutText(id) {
+  const k = kindOf(id);
+  if (k === 'fn') return `the function ${labelOf(id, true)} at ${pathOf(id)}`;
+  if (k === 'file') return `the file ${S.I.files.get(id)?.rel}`;
+  return `${labelOf(id, true)} (${k})`;
+}
+// a path:line in an answer opens that file, when it's one of the map's files
+function askFile(p) {
+  const m = p.match(/^(.+?)(?::(\d+))?(?:-\d+)?$/);
+  if (!m || !/\.[a-z]+$/i.test(m[1])) return null;
+  const want = m[1].replace(/^\.\//, '');
+  if (!S.I.byPath) S.I.byPath = [...S.I.files.values()].map(f => [absPath(f.id), f.id]);
+  const hit = S.I.byPath.filter(([full]) => full === want || full.endsWith('/' + want));
+  if (hit.length !== 1) return null;
+  const id = hit[0][1], line = +m[2];
+  const fn = line ? (S.I.fnsByFile.get(id) || []).filter(f => f.line <= line).pop() : null;
+  return { v: 'file', id, fn: fn?.id };
+}
+function mdInline(t) {
+  return esc(t)
+    .replace(/`([^`]+)`/g, (_, c) => { const r = askFile(c); return r ? `<a class="click code" data-go="${esc(JSON.stringify(r))}">${c}</a>` : `<code>${c}</code>`; })
+    .replace(/\*\*([^*]+)\*\*/g, '<b>$1</b>')
+    .replace(/\[([^\]]+)\]\((https?:[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
+}
+// just enough Markdown for an answer: paragraphs, headings, lists, code blocks, tables, `code`, **bold**, links
+function md(src) {
+  const out = [], L = src.split('\n');
+  for (let i = 0; i < L.length;) {
+    const l = L[i];
+    if (/^```/.test(l)) {
+      const code = []; i++;
+      while (i < L.length && !/^```/.test(L[i])) code.push(L[i++]);
+      i++; out.push(`<pre><code>${esc(code.join('\n'))}</code></pre>`); continue;
+    }
+    if (/^#{1,6}\s/.test(l)) { out.push(`<h4>${mdInline(l.replace(/^#+\s*/, ''))}</h4>`); i++; continue; }
+    if (/^\s*\|/.test(l)) {
+      const rows = [];
+      while (i < L.length && /^\s*\|/.test(L[i])) { if (!/^\s*\|[\s:|-]+\|\s*$/.test(L[i])) rows.push(L[i].trim().replace(/^\||\|$/g, '').split('|')); i++; }
+      out.push(`<table>${rows.map((r, j) => `<tr>${r.map(c => j ? `<td>${mdInline(c.trim())}</td>` : `<th>${mdInline(c.trim())}</th>`).join('')}</tr>`).join('')}</table>`); continue;
+    }
+    if (/^\s*([-*]|\d+\.)\s/.test(l)) {
+      const ol = /^\s*\d+\./.test(l), items = [];
+      while (i < L.length && /^\s*([-*]|\d+\.)\s/.test(L[i])) items.push(L[i++].replace(/^\s*([-*]|\d+\.)\s+/, ''));
+      out.push(`<${ol ? 'ol' : 'ul'}>${items.map(x => `<li>${mdInline(x)}</li>`).join('')}</${ol ? 'ol' : 'ul'}>`); continue;
+    }
+    if (!l.trim()) { i++; continue; }
+    const para = [];
+    while (i < L.length && L[i].trim() && !/^(```|#{1,6}\s|\s*\||\s*([-*]|\d+\.)\s)/.test(L[i])) para.push(L[i++]);
+    out.push(`<p>${mdInline(para.join('\n')).replace(/\n/g, '<br>')}</p>`);
+  }
+  return out.join('');
+}
+function askMsg(m) {
+  if (m.who === 'you') return `<div class="msg you">${m.about ? `<small>About ${esc(m.about)}</small>` : ''}<p>${esc(m.text)}</p></div>`;
+  const looks = m.tools.length ? `<details class="ask-tools"><summary>Looked at the code ${plural(m.tools.length, 'time')}</summary><ul>${m.tools.map(t => `<li>${esc(t)}</li>`).join('')}</ul></details>` : '';
+  const wait = m.busy && !m.text ? `<p class="ask-wait">${esc(m.tools.length ? m.tools[m.tools.length - 1] + '…' : 'Thinking…')}</p>` : '';
+  const meta = m.busy ? '' : [m.stopped && 'Stopped', m.ms && `${Math.round(m.ms / 1000)}s`, m.cost != null && `$${m.cost.toFixed(3)}`].filter(Boolean).join(' · ');
+  return `<div class="msg ai${m.busy ? ' busy' : ''}">${looks}${wait}<div class="md">${md(m.text)}</div>${m.err ? `<div class="callout"><b>Claude couldn't answer</b>${esc(m.err)}</div>` : ''}${meta ? `<small class="ask-meta">${meta}</small>` : ''}</div>`;
+}
+function askPaint() {
+  const A = S.ask, log = $('asklog');
+  if (S.r.v !== 'ask' || !log) return;
+  const near = log.scrollHeight - log.scrollTop - log.clientHeight < 80;
+  const last = log.lastElementChild;
+  if (last) { last.outerHTML = askMsg(A.msgs[A.msgs.length - 1]); wireList(log); }
+  if (near) log.scrollTop = log.scrollHeight;
+}
+async function askSend(q) {
+  const A = S.ask, about = A.about;
+  const m = { who: 'ai', text: '', tools: [], busy: true };
+  A.msgs.push({ who: 'you', text: q, about: about && labelOf(about, true) }, m);
+  A.draft = ''; A.ctrl = new AbortController(); render();
+  try {
+    const res = await fetch('/api/ask', { method: 'POST', headers: { 'Content-Type': 'application/json' }, signal: A.ctrl.signal,
+      body: JSON.stringify({ p: S.p, q, session: A.session, focus: about ? askAboutText(about) : null }) });
+    if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || res.statusText);
+    const rd = res.body.getReader(), dec = new TextDecoder();
+    let buf = '';
+    for (;;) {
+      const { value, done } = await rd.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      let i;
+      while ((i = buf.indexOf('\n')) >= 0) {
+        const ev = JSON.parse(buf.slice(0, i)); buf = buf.slice(i + 1);
+        if (ev.t === 'session') A.session = ev.d;
+        else if (ev.t === 'text') m.text += ev.d;
+        else if (ev.t === 'tool') m.tools.push(ev.d);
+        else if (ev.t === 'error') m.err = ev.d;
+        else if (ev.t === 'done') Object.assign(m, { cost: ev.cost, ms: ev.ms });
+      }
+      askPaint();
+    }
+  } catch (err) {
+    if (err.name === 'AbortError') m.stopped = true; else m.err = err.message;
+  }
+  m.busy = false; A.ctrl = null;
+  if (S.r.v === 'ask') render();
+}
+function viewAsk() {
+  const A = S.ask;
+  crumbs([['Ask Claude']]);
+  legend([]);
+  $('readout').innerHTML = `Ask anything about <b>${esc(S.g.name)}</b>, or anything at all. Claude reads the code to answer but never changes it.
+    <small>Runs <code>claude -p</code> with Sonnet on high effort in the project folder, so each question uses your Claude account.</small>`;
+  const svg = $('svg'); svg.innerHTML = ''; svg.style.display = 'none'; VP.key = null;
+  const intro = `<div class="empty"><h2>What do you want to know?</h2><p>For example:</p><ul class="ask-eg">${['How does a request get from the app to the database?', 'Where is sign-in checked?', 'What would break if I renamed this table?', 'Which parts have no tests?']
+    .map(q => `<li><button type="button" class="btn2" data-q="${esc(q)}">${esc(q)}</button></li>`).join('')}</ul></div>`;
+  $('empty').innerHTML = `<div class="ask"><div class="ask-log" id="asklog">${A.msgs.length ? A.msgs.map(askMsg).join('') : intro}</div>
+    <form class="ask-box" id="askform">
+      ${A.about ? `<span class="ask-about">About ${esc(labelOf(A.about, true))}<button type="button" id="askx" title="Don't send what you were looking at" aria-label="Remove">×</button></span>` : ''}
+      <textarea id="askq" rows="2" placeholder="${A.session ? 'Ask a follow-up…' : 'Ask about this project, or anything…'}" aria-label="Question">${esc(A.draft || '')}</textarea>
+      <div class="ask-act"><small>Enter to send · Shift+Enter for a new line</small>
+        ${A.msgs.length && !A.ctrl ? '<button type="button" class="btn2" id="asknew">New chat</button>' : ''}
+        <button class="btn" id="asksend">${A.ctrl ? 'Stop' : 'Ask'}</button></div>
+    </form></div>`;
+  $('cvtools').innerHTML = ''; wireList($('empty'));  // no zoom or Raw / Simple here
+  const box = $('askq'), log = $('asklog');
+  log.scrollTop = log.scrollHeight;
+  const send = () => { const q = box.value.trim(); if (q && !A.ctrl) askSend(q); };
+  box.oninput = () => { A.draft = box.value; };
+  box.onkeydown = e => { if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); send(); } };
+  $('askform').onsubmit = e => { e.preventDefault(); A.ctrl ? A.ctrl.abort() : send(); };
+  if ($('askx')) $('askx').onclick = () => { A.about = null; render(); };
+  if ($('asknew')) $('asknew').onclick = () => { Object.assign(A, { msgs: [], session: null }); render(); };
+  log.querySelectorAll('[data-q]').forEach(b => b.onclick = () => askSend(b.dataset.q));
+  if (!A.ctrl) box.focus();
+  $('panel').innerHTML = `<div><h3>What Claude can do here</h3><ul class="plain"><li>Read, search and list files in <code>${esc(S.g.root || '')}</code></li><li>Nothing else: no edits, no commands</li></ul></div>
+    <div><h3>Tips</h3><ul class="plain"><li>Open a file or function first, then come here: the question is sent with what you were looking at.</li><li>Paths in an answer open on the map.</li><li>Follow-ups remember the conversation until <b>New chat</b>.</li></ul></div>`;
 }
 
 // ---------- Resources ----------

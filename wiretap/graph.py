@@ -45,7 +45,8 @@ DEFAULT_HOSTS = {"razorpay.com": "Razorpay", "googleapis.com": "Google APIs", "s
 
 TS_EXT = (".ts", ".tsx", ".js", ".jsx", ".mjs")
 # bump when what the parsers or adapters record changes, so cached extractions are redone
-EXTRACT_FORMAT = 6
+EXTRACT_FORMAT = 7
+CLASS_RE = re.compile(r"\.(-?[A-Za-z_][\w-]*)")  # class names in a CSS selector
 # objects whose .get(url) / .post(url) are HTTP calls, when an app's config doesn't name its own
 DEFAULT_HTTP_CLIENTS = ["api", "axios", "apiClient", "http", "this.http", "client"]
 SKIP_DIRS = {"node_modules", "venv", ".venv", "__pycache__", "dist", "build", ".git", ".expo", "android", "ios",
@@ -325,7 +326,8 @@ class _Linker:
         self.stats = defaultdict(int)
         self.unresolved = defaultdict(int)
         self.unmatched_http = []
-        self.imports = defaultdict(set)  # file id -> file ids it imports (same app)
+        self.imports = defaultdict(set)  # file id -> file ids it imports or loads (same app)
+        self.styled = defaultdict(set)  # file id -> stylesheets whose classes it uses (same app)
         self.per_app = defaultdict(lambda: defaultdict(int))  # app id -> counters for the coverage report
         self.guessed_prefix = {}  # app id -> path prefix worked out from its API calls (no pathPrefix in the config)
         self._edge_seen = set()
@@ -462,6 +464,7 @@ class _Linker:
             "unresolved": sorted(self.unresolved.items(), key=lambda kv: -kv[1])[:60],
             "unmatched_http": self.unmatched_http[:300],
             "imports": {f: sorted(t) for f, t in self.imports.items()},
+            "styles": {f: sorted(t) for f, t in self.styled.items()},
             "coverage": coverage.report(self.p, self),
         }
 
@@ -747,6 +750,15 @@ class _Linker:
                 tgt = resolve_spec(rel, imp["spec"])
                 if tgt and tgt != rel:
                     self.imports[f"f:{app.id}:{rel}"].add(f"f:{app.id}:{tgt}")
+
+        # a file that uses two or more of a stylesheet's classes is styled by it (one shared name like "active" is chance)
+        sheets = {rel: {c for f in x["functions"] for c in CLASS_RE.findall(f["name"])} for rel, x in X.items()
+                  if rel.endswith(style_extract.STYLE_EXT)}
+        for rel, x in X.items():
+            used = set(x.get("classes") or ())
+            for css, defined in sheets.items() if used else ():
+                if len(used & defined) >= 2:
+                    self.styled[f"f:{app.id}:{rel}"].add(f"f:{app.id}:{css}")
 
         destructured = {}  # (rel, fn qual, local) -> (prop, hook)
         for rel, x in X.items():

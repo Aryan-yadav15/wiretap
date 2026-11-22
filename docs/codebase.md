@@ -8,9 +8,10 @@ wiretap/                    the server (Python standard library only)
   ts_extract.mjs            TypeScript parser (TypeScript compiler API), run as a Node child process; runs the TS adapters
   adapters/                 one file per framework or library: routes, tables, HTTP calls, jobs (see adapters.md)
   coverage.py               what was understood per app and what wasn't (other languages, libraries no adapter reads)
-  style_extract.py          stylesheet rules as "functions" (CSS, SCSS, Sass, Less); HTML files listed
+  style_extract.py          stylesheet rules as "functions" (CSS, SCSS, Sass, Less); what HTML pages and @imports load
   session.py                hook events → sessions, tasks, timeline, function diffs, shell-read parsing
   server.py                 HTTP + SSE server, projects (State, ProjectState), file watcher, hook queue, search, summary
+  ask.py                    Ask: a question answered by claude -p (Sonnet, high effort, read-only tools), streamed back
   simplify.py               Simple mode: plain-English names per file and flow step from claude -p, cached by function hash
 web/                        the UI: index.html, style.css, app.js (no build step); vendor/elk: the layout library, copied in
 claude-mod/wiretap-live/    Claude Code mod: the button above the prompt and /wiretap

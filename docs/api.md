@@ -124,7 +124,20 @@ curl -s -X POST -H 'Content-Type: application/json' \
 
 ## `POST /api/summarize`
 
-Body `{"session": "<id>", "task": <index>}`. Runs `claude -p --model haiku` on the task's git diff and returns `{"text": "…"}`. When the task changed nothing it returns a fixed text without calling Claude. Errors come back as `{"error": "…"}` (unknown session, no `claude` on PATH, timeout after 3 minutes). Besides Simple mode (below), this is the only call that uses tokens. Defined in [`server.py:194`](../wiretap/server.py#L194).
+Body `{"session": "<id>", "task": <index>}`. Runs `claude -p --model haiku` on the task's git diff and returns `{"text": "…"}`. When the task changed nothing it returns a fixed text without calling Claude. Errors come back as `{"error": "…"}` (unknown session, no `claude` on PATH, timeout after 3 minutes). Besides Ask and Simple mode (below), this is the only call that uses tokens. Defined in [`server.py:194`](../wiretap/server.py#L194).
+
+## `POST /api/ask`
+
+Body `{"q": "<question>", "p": "<project id>", "session": "<Claude session id to follow up, optional>", "focus": "<what the user is looking at, optional>"}`. Runs `claude -p --model sonnet --effort high` in the project folder with only Read, Grep and Glob, so Claude can look at the code but not change it or run anything. The answer streams back as `application/x-ndjson`, one event per line:
+
+```json
+{"t": "session", "d": "5177e6d9-…"}
+{"t": "tool", "d": "Reading orders.py"}
+{"t": "text", "d": "Orders are created in "}
+{"t": "done", "session": "5177e6d9-…", "cost": 0.052, "ms": 30528}
+```
+
+`wait` lines carry nothing and only show it's still working; `error` lines carry a message. Pass the `session` back to ask a follow-up in the same conversation. Closing the connection stops Claude. Defined in [`wiretap/ask.py`](../wiretap/ask.py) and `_ask` in [`server.py`](../wiretap/server.py).
 
 ## Simple mode: `GET /api/describe`, `POST /api/describe`, `POST /api/flow`
 

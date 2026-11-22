@@ -11,6 +11,7 @@ from collections import defaultdict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
+from . import ask as asker
 from .graph import Project, autodetect
 from .coverage import lines as coverage_lines
 from .session import Sessions
@@ -18,6 +19,8 @@ from .simplify import DescribeError, Describer, cut_steps, jobs_for, layer_of
 
 WEB = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "web")
 CALL_KINDS = {"call", "http", "renders"}
+LINK_WORDS = {"call": ("calls", "called by"), "http": ("calls the API in", "serves an API call from"),
+              "renders": ("renders", "rendered by"), "db": ("uses table", "used by")}
 MAX_DESCRIBE = 24  # files queued per request, in the order given (what's in focus first)
 
 
@@ -28,8 +31,9 @@ class GraphIndex:
         self.callers = defaultdict(set)
         self.fn_file = {f["id"]: f["file"] for f in g["fns"]}
         node_file = {n["id"]: n.get("file") for n in g["nodes"]}
-        # files next to each other: a call either way, an import, or a table both use (tables are their own nodes)
-        self.near = defaultdict(set)
+        # files next to each other, and how: a call either way, an API call, rendering, an import or load, a stylesheet
+        # whose classes it uses, or a table both use (tables are their own nodes). near[a][b] says it from a's side.
+        self.near = defaultdict(dict)
         for e in g["edges"]:
             if e["k"] in CALL_KINDS:
                 self.callers[e["t"]].add(e["s"])
@@ -38,12 +42,15 @@ class GraphIndex:
             a = self.fn_file.get(e["s"]) or node_file.get(e["s"])
             b = e["t"] if e["t"].startswith("tb:") else self.fn_file.get(e["t"]) or node_file.get(e["t"])
             if a and b and a != b:
-                self.near[a].add(b)
-                self.near[b].add(a)
-        for a, targets in g.get("imports", {}).items():
-            for b in targets:
-                self.near[a].add(b)
-                self.near[b].add(a)
+                k = LINK_WORDS.get(e["k"], ("uses", "used by"))
+                self.near[a].setdefault(b, k[0])
+                self.near[b].setdefault(a, k[1])
+        for key, words in (("imports", ("imports", "imported by")), ("styles", ("styled by", "styles"))):
+            for a, targets in g.get(key, {}).items():
+                w = ("loads", "loaded by") if a.endswith((".html", ".css")) else words  # a page's <script>, a sheet's @import
+                for b in targets:
+                    self.near[a].setdefault(b, w[0])
+                    self.near[b].setdefault(a, w[1])
 
     def upstream(self, fn_ids, depth=3, exclude_files=()):
         seen, frontier = set(fn_ids), set(fn_ids)
@@ -57,25 +64,39 @@ class GraphIndex:
         return fns, {self.fn_file[f] for f in fns if f in self.fn_file}
 
     def stray(self, files, depth=2):
-        """Changed files with no call, import or shared table linking them to any other changed file
-        within `depth` hops: usually edits unrelated to the rest of the change."""
+        """Changed files with no call, import, load, stylesheet or shared table linking them to any other changed
+        file within `depth` hops: usually edits unrelated to the rest of the change."""
         # a package marker (__init__.py) is needed without anything calling into it
         files = {f for f in files if not f.endswith("/__init__.py")}
         if len(files) < 2:
             return set()
-        out = set()
+        return {f for f, found in self.links(files, depth).items() if not found}
+
+    def links(self, files, depth=2):
+        """For each changed file, the other changed files it's linked to within `depth` hops, and how:
+        {file: [[other, "calls"], [other, "via orders.py"]]}. A file with none gets an empty list."""
+        files = set(files)
+        out = {}
         for f in files:
-            seen, frontier, linked = {f}, {f}, False
+            found, seen, frontier = [], {f}, {f: None}  # frontier: file -> the first hop on the way to it
             for _ in range(depth):
-                frontier = {n for x in frontier for n in self.near.get(x, ())} - seen
-                if frontier & (files - {f}):
-                    linked = True
-                    break
-                seen |= frontier
-            if not linked:
-                out.add(f)
+                nxt = {}
+                for x, first in frontier.items():
+                    for n, how in self.near.get(x, {}).items():
+                        if n in seen:
+                            continue
+                        seen.add(n)
+                        nxt[n] = first or n
+                        if n in files:
+                            found.append([n, how if not first else "via " + _short(first)])
+                frontier = nxt
+            out[f] = found
         return out
 
+
+def _short(fid):
+    """f:app:web/app.js -> app.js; tb:app:orders -> table orders"""
+    return "table " + fid.rsplit(":", 1)[-1] if fid.startswith("tb:") else fid.rsplit("/", 1)[-1].rsplit(":", 1)[-1]
 
 TOOL = os.path.dirname(WEB)
 
@@ -558,6 +579,8 @@ def make_handler(state):
                 if not ps:
                     return self._send(200, {"error": "No such session"})
                 return self._send(200, ps.summarize(body.get("session"), body.get("task")))
+            if u.path == "/api/ask":
+                return self._ask(body)
             if u.path in ("/api/describe", "/api/flow"):
                 ps = state.get(body.get("p"))
                 if not ps:
@@ -566,6 +589,33 @@ def make_handler(state):
                     return self._send(200, ps.describe([f for f in body.get("files") or [] if isinstance(f, str)]))
                 return self._send(200, ps.flow([i for i in body.get("ids") or [] if isinstance(i, str)][:40]))
             return self._send(404, {"error": "not found"})
+
+        def _ask(self, body):
+            """Stream an answer as one JSON event per line, until it's done or the browser stops listening."""
+            q = (body.get("q") or "").strip()
+            if not q:
+                return self._send(400, {"error": "empty question"})
+            with state.lock:
+                ps = state.get(body.get("p"))
+                root = ps.project.root if ps else os.path.dirname(WEB)
+                system = asker.system_prompt(ps.graph if ps else {}, str(body.get("focus") or "")[:200] or None)
+            resume = body.get("session")
+            resume = resume if isinstance(resume, str) and re.fullmatch(r"[0-9a-f-]{36}", resume) else None
+            self.send_response(200)
+            self.send_header("Content-Type", "application/x-ndjson")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.close_connection = True
+            events = asker.ask(q[:8000], root, system, resume)
+            try:
+                for ev in events:
+                    self.wfile.write(json.dumps(ev).encode() + b"\n")
+                    self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                pass
+            finally:
+                events.close()
 
     return H
 
